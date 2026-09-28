@@ -1,0 +1,42 @@
+# Alert rules for pg-outbox-relay. Tune the thresholds to your traffic and to
+# Postgres' max_slot_wal_keep_size (the slot is invalidated past that size).
+groups:
+  - name: pg-outbox-relay
+    rules:
+      - alert: OutboxSlotLagHigh
+        expr: pg_outbox_slot_lag_bytes > 512 * 1024 * 1024
+        for: 10m
+        labels:
+          severity: page
+        annotations:
+          summary: "Replication slot holds {{ $value | humanize1024 }}B of WAL"
+          description: >-
+            The relay is behind or stuck (check pg_outbox_publish_errors_total).
+            Postgres keeps this WAL until the relay acknowledges it.
+
+      - alert: OutboxRelayDown
+        # While the relay is down its own lag metric vanishes, but the slot keeps growing.
+        expr: up{job="relay"} == 0
+        for: 5m
+        labels:
+          severity: page
+        annotations:
+          summary: "pg-outbox-relay is down; the replication slot is growing"
+
+      - alert: OutboxPublishStalled
+        expr: >-
+          sum(increase(pg_outbox_publish_errors_total{kind="retryable"}[5m])) > 0
+          and sum(increase(pg_outbox_events_published_total[5m])) == 0
+        for: 5m
+        labels:
+          severity: page
+        annotations:
+          summary: "The broker rejects every publish; events are waiting in the WAL"
+
+      - alert: OutboxPoisonEvents
+        expr: increase(pg_outbox_dead_letters_total[15m]) > 0
+        labels:
+          severity: ticket
+        annotations:
+          summary: "Events were rejected permanently and skipped"
+          description: "Their full envelopes are in the relay's ERROR logs (message: event rejected permanently)."

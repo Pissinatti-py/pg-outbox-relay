@@ -15,7 +15,11 @@ use tracing_subscriber::EnvFilter;
 async fn main() -> ExitCode {
     tracing_subscriber::fmt()
         .json()
-        .with_env_filter(EnvFilter::try_from_default_env().unwrap_or_else(|_| "info".into()))
+        // pgwire_replication logs errors it also returns to us, and we log those ourselves.
+        .with_env_filter(
+            EnvFilter::try_from_default_env()
+                .unwrap_or_else(|_| "info,pgwire_replication=off".into()),
+        )
         .init();
 
     match run().await {

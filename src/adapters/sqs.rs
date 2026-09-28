@@ -30,9 +30,13 @@ pub struct SqsSink {
 
 impl SqsSink {
     /// Uses the standard AWS configuration chain (env, profile, IAM role; `AWS_ENDPOINT_URL`
-    /// for LocalStack), then checks the queue so a wrong URL or missing permission fails now.
+    /// for a local SQS such as ElasticMQ).
     pub async fn connect(config: SqsConfig) -> anyhow::Result<Self> {
-        let client = Client::new(&aws_config::load_from_env().await);
+        Self::with_client(Client::new(&aws_config::load_from_env().await), config).await
+    }
+
+    /// Checks the queue first, so a wrong URL or a missing permission fails at startup.
+    pub async fn with_client(client: Client, config: SqsConfig) -> anyhow::Result<Self> {
         client
             .get_queue_attributes()
             .queue_url(&config.queue_url)

@@ -1,0 +1,60 @@
+# Demo: Postgres → pg-outbox-relay → SQS (ElasticMQ), with Prometheus and Grafana.
+# See README.md → Quickstart.
+name: pg-outbox-relay
+
+services:
+  postgres:
+    image: postgres:17
+    command: ["postgres", "-c", "wal_level=logical", "-c", "max_slot_wal_keep_size=1GB"]
+    environment:
+      POSTGRES_USER: app
+      POSTGRES_PASSWORD: app
+      POSTGRES_DB: app
+    volumes:
+      - ./sql:/sql:ro
+      - ./deploy/postgres/init.sh:/docker-entrypoint-initdb.d/init.sh:ro
+    healthcheck:
+      test: ["CMD", "pg_isready", "-h", "127.0.0.1", "-U", "app", "-d", "app"]  # TCP: the init phase listens on the socket only
+      interval: 2s
+      retries: 30
+
+  sqs:
+    image: softwaremill/elasticmq-native:1.7.1
+    volumes:
+      - ./deploy/elasticmq/elasticmq.conf:/opt/elasticmq.conf:ro
+    ports: ["9324:9324"]
+
+  relay:
+    build: .
+    depends_on:
+      postgres: { condition: service_healthy }
+      sqs: { condition: service_started }
+    environment:
+      RELAY__SOURCE__DSN: postgres://relay:relay@postgres:5432/app?sslmode=disable
+      RELAY__SOURCE__SLOT: outbox_relay
+      RELAY__SOURCE__PUBLICATION: outbox_pub
+      RELAY__SINK__KIND: sqs
+      RELAY__SINK__QUEUE_URL: http://sqs:9324/000000000000/events.fifo
+      AWS_ENDPOINT_URL: http://sqs:9324
+      AWS_REGION: us-east-1
+      AWS_ACCESS_KEY_ID: demo
+      AWS_SECRET_ACCESS_KEY: demo
+    ports: ["9090:9090"]
+    # Crash-only: after any failure a restart replays everything not yet acknowledged.
+    restart: unless-stopped
+
+  prometheus:
+    image: prom/prometheus:latest
+    volumes:
+      - ./deploy/prometheus:/etc/prometheus:ro
+    ports: ["9091:9090"]
+
+  grafana:
+    image: grafana/grafana:latest
+    environment:
+      GF_AUTH_ANONYMOUS_ENABLED: "true"
+      GF_AUTH_ANONYMOUS_ORG_ROLE: Admin
+      GF_DASHBOARDS_DEFAULT_HOME_DASHBOARD_PATH: /etc/grafana/provisioning/dashboards/relay.json
+    volumes:
+      - ./deploy/grafana:/etc/grafana/provisioning:ro
+    ports: ["3001:3000"]

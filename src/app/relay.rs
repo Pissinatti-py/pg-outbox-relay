@@ -56,9 +56,9 @@ impl Default for Retry {
 ///
 /// A source error is returned right away: nothing unpublished was acked, so a
 /// restart replays it. A clean stop first publishes everything the source sent.
-pub async fn run(
+pub async fn run<K: EventSink>(
     source: impl EventSource,
-    sink: impl EventSink,
+    sink: K,
     batching: Batching,
     retry: Retry,
     health: Arc<Health>,
@@ -67,6 +67,13 @@ pub async fn run(
         batching.max_events > 0,
         "batching.max_events must be at least 1"
     );
+    // Exported from the start, so dashboards show 0 instead of "no data".
+    metrics::counter!("pg_outbox_events_published_total", "sink" => K::NAME).increment(0);
+    for kind in ["retryable", "permanent"] {
+        metrics::counter!("pg_outbox_publish_errors_total", "sink" => K::NAME, "kind" => kind)
+            .increment(0);
+    }
+    metrics::counter!("pg_outbox_dead_letters_total").increment(0);
 
     let (tx, rx) = mpsc::channel(CHANNEL_CAPACITY);
     let (ack, acked) = watch::channel(Lsn::default());
