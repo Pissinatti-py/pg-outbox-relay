@@ -4,7 +4,11 @@
 //! - [`domain`]: pure rules (events, envelope, checkpointing, batching, backoff).
 //! - [`ports`]: the traits the core needs from the outside world.
 //! - [`app`]: the relay pipeline, built only on `domain` and `ports`.
+//! - [`adapters`]: Postgres, SQS and HTTP behind those ports.
+//! - [`config`]: loads every layer's settings; used by `main`.
 
+pub mod adapters;
 pub mod app;
+pub mod config;
 pub mod domain;
 pub mod ports;

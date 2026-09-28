@@ -12,11 +12,15 @@ config = { version = "0.15.26", default-features = false, features = ["toml"] }
 fastrand = "2.5.0"
 metrics = "0.24.6"
 metrics-exporter-prometheus = { version = "0.18.3", default-features = false }
+percent-encoding = "2.3.2"
+pgwire-replication = "0.4.1"
 serde = { version = "1.0.229", features = ["derive"] }
 serde_json = { version = "1.0.151", features = ["raw_value"] }
 tokio = { version = "1.53.1", features = ["rt-multi-thread", "macros", "signal", "time", "sync", "net"] }
+tokio-postgres = "0.7.18"
 tracing = "0.1.44"
 tracing-subscriber = { version = "0.3.23", features = ["json", "env-filter"] }
+url = "2.5.8"
 
 [dev-dependencies]
 tokio = { version = "1.53.1", features = ["test-util", "macros", "rt-multi-thread"] }

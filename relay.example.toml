@@ -1,0 +1,29 @@
+# pg-outbox-relay configuration.
+#
+# Pass the path as the first argument (default: ./relay.toml). Every value can be
+# overridden by an environment variable RELAY__<SECTION>__<KEY>, for example
+# RELAY__SOURCE__DSN or RELAY__SINK__QUEUE_URL. Without a file, the environment alone works.
+
+[source]
+# libpq-style URL. sslmode: disable | prefer (default) | require | verify-ca | verify-full;
+# the verify modes take sslrootcert=/path/to/ca.pem (system roots when omitted).
+dsn         = "postgres://relay:change-me@db:5432/app?sslmode=verify-full"
+slot        = "outbox_relay"   # created by sql/slot.sql; the relay never creates it
+publication = "outbox_pub"     # created by sql/outbox.sql
+
+[sink]
+kind      = "sqs"              # M1 ships sqs; sns and redis arrive in M2
+# A .fifo queue keeps per-aggregate order and deduplicates on the event id.
+# Credentials and region come from the standard AWS chain (env vars, profile, IAM role).
+queue_url = "https://sqs.us-east-1.amazonaws.com/123456789012/events.fifo"
+
+[batching]
+max_events  = 10               # events per publish (SQS takes up to 10 per call)
+max_wait_ms = 20               # how long a buffered event waits for company
+
+[retry]                        # broker errors are retried forever, with jittered backoff
+initial_backoff_ms = 100
+max_backoff_ms     = 30000
+
+[server]
+listen = "0.0.0.0:9090"        # /metrics, /healthz, /readyz
