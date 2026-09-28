@@ -1,0 +1,22 @@
+[package]
+name = "pg-outbox-relay"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+anyhow = "1.0.104"
+aws-config = { version = "1.12.0", features = ["behavior-version-latest"] }
+aws-sdk-sqs = "1.113.0"
+axum = "0.8.9"
+config = { version = "0.15.26", default-features = false, features = ["toml"] }
+fastrand = "2.5.0"
+metrics = "0.24.6"
+metrics-exporter-prometheus = { version = "0.18.3", default-features = false }
+serde = { version = "1.0.229", features = ["derive"] }
+serde_json = { version = "1.0.151", features = ["raw_value"] }
+tokio = { version = "1.53.1", features = ["rt-multi-thread", "macros", "signal", "time", "sync", "net"] }
+tracing = "0.1.44"
+tracing-subscriber = { version = "0.3.23", features = ["json", "env-filter"] }
+
+[dev-dependencies]
+tokio = { version = "1.53.1", features = ["test-util", "macros", "rt-multi-thread"] }
