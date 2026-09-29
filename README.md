@@ -228,6 +228,7 @@ Each SQS message body is the envelope shown in the [Quickstart](#quickstart-5-mi
 - **Deduplicate on `id`.** Delivery is at-least-once. A FIFO queue drops duplicates within its 5-minute deduplication window. Beyond that, record processed ids, for example with a processed-events table or a Redis `SET NX`.
 - **FIFO queues** deliver each aggregate's events in commit order (`MessageGroupId = aggregate_type:aggregate_id`). **Standard queues** also work but do not keep order; the `id` is available as a message attribute there too.
 - **SNS:** subscribe queues with raw message delivery, so the body is the envelope. `id` and `event_type` are message attributes, usable in subscription filter policies. A `.fifo` topic keeps the same per-aggregate order and delivers to `.fifo` queues.
+- **Redis Streams:** each entry has `id`, `event_type` and `envelope` (the JSON above), in the stream `outbox:<aggregate_type>`. An aggregate's events stay in order within its stream. Read with `XREADGROUP` and deduplicate on `id`. The relay never trims: use `XTRIM <stream> MINID <id>` once every consumer group has passed an entry (`MAXLEN` drops entries a lagging group has not read).
 - **Rows can be deleted** once they are published, for example with a nightly job that deletes rows older than 7 days, or with daily partitions you drop. The WAL already carried them. If you partition `outbox`, create the publication `WITH (publish = 'insert', publish_via_partition_root = true)`.
 
 ## Examples
@@ -419,9 +420,11 @@ The relay reads a TOML file (first argument, default `./relay.toml`), then envir
 | `source.dsn` | `RELAY__SOURCE__DSN` | required | `postgres://user:password@host:5432/db?sslmode=verify-full&sslrootcert=/ca.pem`. `sslmode`: `disable`, `prefer` (default), `require`, `verify-ca`, `verify-full`. It applies to every connection: replication, slot lag and dead letters |
 | `source.slot` | `RELAY__SOURCE__SLOT` | required | Replication slot, for example `outbox_relay` |
 | `source.publication` | `RELAY__SOURCE__PUBLICATION` | required | Publication, for example `outbox_pub` |
-| `sink.kind` | `RELAY__SINK__KIND` | required | `sqs` or `sns` |
+| `sink.kind` | `RELAY__SINK__KIND` | required | `sqs`, `sns` or `redis` |
 | `sink.queue_url` | `RELAY__SINK__QUEUE_URL` | required for `sqs` | A `.fifo` URL enables ordering and deduplication |
 | `sink.topic_arn` | `RELAY__SINK__TOPIC_ARN` | required for `sns` | A `.fifo` ARN enables ordering and deduplication |
+| `sink.url` | `RELAY__SINK__URL` | required for `redis` | `redis://user:password@host:6379/0`; `rediss://` for TLS |
+| `sink.stream_prefix` | `RELAY__SINK__STREAM_PREFIX` | `outbox:` | Events go to the stream `<prefix><aggregate_type>` |
 | `batching.max_events` | `RELAY__BATCHING__MAX_EVENTS` | `10` | Events per publish |
 | `batching.max_wait_ms` | `RELAY__BATCHING__MAX_WAIT_MS` | `20` | How long a lone event waits for company |
 | `retry.initial_backoff_ms` | `RELAY__RETRY__INITIAL_BACKOFF_MS` | `100` | First retry delay (jittered) |
@@ -485,7 +488,7 @@ To republish one after fixing the cause, insert a corrected row into `outbox` wi
 | SQS is down, throttling, or credentials are wrong | Retried forever with backoff. The slot keeps the WAL, `/readyz` turns 503, `OutboxPublishStalled` fires. Nothing is lost |
 | The database restarts or the connection drops | The relay exits (crash-only design), the orchestrator restarts it, it waits for the database and resumes from the last ack |
 | A transaction rolls back | It never reaches the WAL stream, so it is never published |
-| SQS rejects an event for good (invalid content, too large) | Stored in `outbox_dead_letter` with the broker's reason (retried until it is), logged at `ERROR`, counted in `pg_outbox_dead_letters_total`, then skipped so one bad row cannot block the stream |
+| The broker (SQS or SNS) rejects an event for good (invalid content, too large) | Stored in `outbox_dead_letter` with the broker's reason (retried until it is), logged at `ERROR`, counted in `pg_outbox_dead_letters_total`, then skipped so one bad row cannot block the stream. Redis never rejects content, so the Redis sink never dead-letters |
 | SIGTERM (deploys) | Stops reading the WAL at a transaction boundary, publishes everything already read, sends a final ack, and exits 0, so the next start replays nothing. During a broker outage the drain waits. A second SIGTERM/SIGINT, or the orchestrator's SIGKILL, stops it, and unacknowledged events replay |
 
 Exactly-once is not a goal. It is the consumer's job, made possible by `id`.
@@ -496,7 +499,7 @@ Prerequisites: Rust 1.94.1 or newer (the AWS SDK sets that minimum) and Docker f
 
 ```bash
 cargo test                          # unit, core and architecture tests: fast, no Docker
-cargo test -- --ignored             # end to end (SQS, SNS, dead letters) and the crash tests: the relay binary under SIGTERM and SIGKILL
+cargo test -- --ignored             # end to end (SQS, SNS, Redis, dead letters) and the crash tests: the relay binary under SIGTERM and SIGKILL
 cargo fmt --check && cargo clippy --all-targets -- -D warnings
 cargo run -- relay.toml             # against your own Postgres and SQS
 ```

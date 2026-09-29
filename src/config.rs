@@ -8,6 +8,7 @@ use config::{Environment, File, FileFormat};
 use serde::Deserialize;
 
 use crate::adapters::postgres::PgConfig;
+use crate::adapters::redis::RedisConfig;
 use crate::adapters::sns::SnsConfig;
 use crate::adapters::sqs::SqsConfig;
 use crate::app::relay::{Batching, Retry};
@@ -29,6 +30,7 @@ pub struct Config {
 pub enum SinkConfig {
     Sqs(SqsConfig),
     Sns(SnsConfig),
+    Redis(RedisConfig),
 }
 
 #[derive(Debug, Deserialize)]
@@ -155,6 +157,14 @@ mod tests {
             panic!("expected the sns sink");
         };
         assert!(sns.topic_arn.ends_with(".fifo"));
+        let SinkConfig::Redis(redis) = sink(&[
+            ("RELAY__SINK__KIND", "redis"),
+            ("RELAY__SINK__URL", "redis://cache:6379"),
+        ]) else {
+            panic!("expected the redis sink");
+        };
+        assert_eq!(redis.url, "redis://cache:6379");
+        assert_eq!(redis.stream_prefix, "outbox:");
     }
 
     #[test]

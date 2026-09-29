@@ -2,5 +2,6 @@
 
 pub mod http;
 pub mod postgres;
+pub mod redis;
 pub mod sns;
 pub mod sqs;

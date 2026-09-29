@@ -11,7 +11,7 @@ For what the relay is and how to run it, see the [README](../README.md). The ori
 
 ```
             ┌──────────────── adapters (I/O) ─────────────────┐
-            │  postgres/ (source)  sqs · sns (sinks)  http    │
+            │  postgres/ (source)  sqs·sns·redis (sinks) http │
             └───────┬─────────────────▲──────────────▲────────┘
                     │ implements      │ implements   │ reads
             ┌───────▼─────────────────┴──────────────┴────────┐
@@ -57,6 +57,7 @@ The core may use two facades, much like `log`: `tracing` for logs and `metrics` 
 | `src/adapters/postgres/dead_letter.rs` | `PgDeadLetters`: stores rejected events in `outbox_dead_letter`; the startup check | tokio-postgres |
 | `src/adapters/sqs.rs` | `SqsSink`: envelope → `SendMessageBatch`, call splitting, error classification (shared with SNS) | aws-sdk-sqs |
 | `src/adapters/sns.rs` | `SnsSink`: envelope → `PublishBatch`, reusing the SQS splitting, id mapping and classification | aws-sdk-sns |
+| `src/adapters/redis.rs` | `RedisSink`: `XADD` of `id`, `event_type`, `envelope` to one stream per aggregate type | redis |
 | `src/adapters/http.rs` | `/metrics`, `/healthz`, `/readyz` | axum, metrics-exporter-prometheus |
 | `src/config.rs` | TOML file + `RELAY__…` env overrides → each layer's own settings struct | config |
 | `src/main.rs` | Wires everything together; logging; signals | everything |
@@ -112,6 +113,7 @@ The core may use two facades, much like `log`: `tracing` for logs and `metrics` 
 | Dependency rule | `tests/architecture.rs` | `cargo test` | nothing |
 | End to end: Postgres 17 over TLS → relay → SQS API (ElasticMQ) | `tests/e2e_sqs.rs` | `cargo test -- --ignored` | Docker |
 | End to end: Postgres 17 → relay → SNS FIFO topic → SQS FIFO queue (moto) | `tests/e2e_sns.rs` | `cargo test -- --ignored` | Docker |
+| End to end: Postgres 17 → relay → Redis Streams | `tests/e2e_redis.rs` | `cargo test -- --ignored` | Docker |
 | The Postgres adapter against a real database: the dead-letter table and its startup check | `tests/e2e_postgres.rs` | `cargo test -- --ignored` | Docker |
 | The relay binary under signals: SIGTERM drains without replays, a second signal ends a stuck drain, SIGKILL loses nothing | `tests/crash.rs` | `cargo test -- --ignored` | Docker |
 
@@ -151,4 +153,5 @@ Each is marked in the code with a `ponytail:` comment naming the upgrade path.
 | A transaction's rows wait for its `Commit` in memory | Very large outbox transactions use memory | Stream in-progress transactions (pgoutput protocol v2) |
 | Channel capacity fixed at 1024 | — | Make it configurable if a benchmark shows it matters |
 | One SQL connection per dead letter | Fine while dead letters are rare | Keep one connection open |
+| Redis: one `XADD` round trip per event | About 10 round trips per batch | Pipeline the batch if the M4 benchmarks ask for it |
 | A drain waits for the broker | An outage holds it until SIGKILL or a second signal (safe: unacked events replay) | — |

@@ -16,6 +16,8 @@ const INFRA: &[&str] = &[
     "postgres_",
     "metrics_exporter_prometheus::",
     "config::",
+    "redis::",
+    "rustls::",
 ];
 
 #[test]

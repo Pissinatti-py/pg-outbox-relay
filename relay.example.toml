@@ -12,12 +12,15 @@ slot        = "outbox_relay"   # created by sql/slot.sql; the relay never create
 publication = "outbox_pub"     # created by sql/outbox.sql
 
 [sink]
-kind      = "sqs"              # sqs | sns
+kind      = "sqs"              # sqs | sns | redis
 # Credentials and region come from the standard AWS chain (env vars, profile, IAM role).
 # sqs: a .fifo queue keeps per-aggregate order and deduplicates on the event id.
 queue_url = "https://sqs.us-east-1.amazonaws.com/123456789012/events.fifo"
 # sns: a .fifo topic does the same; subscribe queues with raw message delivery.
 # topic_arn = "arn:aws:sns:us-east-1:123456789012:events.fifo"
+# redis: one stream per aggregate type, named <stream_prefix><aggregate_type>.
+# url           = "rediss://:password@cache:6379"
+# stream_prefix = "outbox:"
 
 [batching]
 max_events  = 10               # events per publish (SQS takes up to 10 per call)

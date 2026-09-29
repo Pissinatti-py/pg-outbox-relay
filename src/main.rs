@@ -5,6 +5,7 @@ use std::sync::Arc;
 
 use pg_outbox_relay::adapters::http;
 use pg_outbox_relay::adapters::postgres::{PgDeadLetters, PgSource};
+use pg_outbox_relay::adapters::redis::RedisSink;
 use pg_outbox_relay::adapters::sns::SnsSink;
 use pg_outbox_relay::adapters::sqs::SqsSink;
 use pg_outbox_relay::app::{Health, relay};
@@ -54,6 +55,10 @@ async fn run() -> anyhow::Result<()> {
             }
             SinkConfig::Sns(sns) => {
                 let sink = SnsSink::connect(sns).await?;
+                relay::run(source, sink, dead_letters, batching, retry, health).await
+            }
+            SinkConfig::Redis(redis) => {
+                let sink = RedisSink::connect(redis).await?;
                 relay::run(source, sink, dead_letters, batching, retry, health).await
             }
         }
