@@ -236,6 +236,7 @@ async fn relay_with(
 ) -> anyhow::Result<()> {
     let health = Arc::new(Health::default());
     relay::run(
+        "fake",
         source,
         sink,
         dead_letters,

@@ -47,6 +47,13 @@ pub struct PgSource {
     stop: watch::Receiver<bool>,
 }
 
+impl PgConfig {
+    /// The source's name: its database. It tags events and labels metrics.
+    pub fn database(&self) -> anyhow::Result<String> {
+        Ok(Dsn::parse(&self.dsn)?.dbname)
+    }
+}
+
 impl PgSource {
     pub fn new(config: PgConfig, health: Arc<Health>, stop: watch::Receiver<bool>) -> Self {
         Self {
@@ -64,6 +71,9 @@ impl EventSource for PgSource {
         acked: watch::Receiver<Lsn>,
     ) -> anyhow::Result<()> {
         let dsn = Dsn::parse(&self.config.dsn)?;
+        // 1 while this relay streams the slot: across replicas, `sum by (source)` shows whether anyone does.
+        let up = metrics::gauge!("pg_outbox_source_up", "source" => dsn.dbname.clone());
+        up.set(0.0);
         let (client, first) = tokio::select! {
             connected = connect(dsn.replication(&self.config)) => connected?,
             // A standby waiting for the slot has nothing to drain.
@@ -72,6 +82,7 @@ impl EventSource for PgSource {
         dead_letter::check(&dsn).await?;
         tracing::info!(slot = %self.config.slot, "streaming from the replication slot");
         self.health.source_ready.store(true, Ordering::Relaxed);
+        up.set(1.0);
 
         let transactions = Transactions {
             out,
@@ -84,6 +95,7 @@ impl EventSource for PgSource {
             () = poll_slot_lag(&dsn, &self.config.slot) => Ok(()),
         };
         self.health.source_ready.store(false, Ordering::Relaxed);
+        up.set(0.0);
         result
     }
 }
@@ -251,9 +263,10 @@ impl Transactions {
 
 /// Exports how much WAL the slot holds back, i.e. what a stuck relay costs the database.
 async fn poll_slot_lag(dsn: &Dsn, slot: &str) {
+    let lag = metrics::gauge!("pg_outbox_slot_lag_bytes", "source" => dsn.dbname.clone());
     loop {
         match slot_lag(dsn, slot).await {
-            Ok(bytes) => metrics::gauge!("pg_outbox_slot_lag_bytes").set(bytes as f64),
+            Ok(bytes) => lag.set(bytes as f64),
             Err(error) => {
                 tracing::warn!(error = format!("{error:#}"), "could not read the slot lag")
             }

@@ -6,6 +6,7 @@ use std::sync::Arc;
 use std::sync::atomic::Ordering;
 use std::time::{Duration, SystemTime};
 
+use metrics::{Counter, Gauge, Histogram};
 use serde::Deserialize;
 use tokio::sync::{mpsc, watch};
 use tokio::time::{Instant, sleep, sleep_until};
@@ -58,6 +59,7 @@ impl Default for Retry {
 /// restart replays it. A clean stop first publishes everything the source sent,
 /// then waits for the source to report the final ack.
 pub async fn run<K: EventSink, D: DeadLetterStore>(
+    name: &str,
     source: impl EventSource,
     sink: K,
     dead_letters: D,
@@ -69,14 +71,6 @@ pub async fn run<K: EventSink, D: DeadLetterStore>(
         batching.max_events > 0,
         "batching.max_events must be at least 1"
     );
-    // Exported from the start, so dashboards show 0 instead of "no data".
-    metrics::counter!("pg_outbox_events_published_total", "sink" => K::NAME).increment(0);
-    for kind in ["retryable", "permanent"] {
-        metrics::counter!("pg_outbox_publish_errors_total", "sink" => K::NAME, "kind" => kind)
-            .increment(0);
-    }
-    metrics::counter!("pg_outbox_dead_letters_total").increment(0);
-
     let (tx, rx) = mpsc::channel(CHANNEL_CAPACITY);
     let (ack, acked) = watch::channel(Lsn::default());
     // A sink that could be constructed counts as reachable until a publish fails.
@@ -85,6 +79,7 @@ pub async fn run<K: EventSink, D: DeadLetterStore>(
     let core = Core {
         sink,
         dead_letters,
+        metrics: Metrics::new(name, K::NAME),
         batching,
         retry,
         health,
@@ -105,9 +100,45 @@ pub async fn run<K: EventSink, D: DeadLetterStore>(
     }
 }
 
+/// The pipeline's metrics, labelled with its source (and sink where it matters).
+struct Metrics {
+    published: Counter,
+    retryable: Counter,
+    permanent: Counter,
+    dead_letters: Counter,
+    latency: Histogram,
+    channel_depth: Gauge,
+}
+
+impl Metrics {
+    fn new(source: &str, sink: &'static str) -> Self {
+        let source = source.to_owned();
+        let errors = |kind: &'static str| metrics::counter!("pg_outbox_publish_errors_total", "sink" => sink, "kind" => kind, "source" => source.clone());
+        let metrics = Self {
+            published: metrics::counter!("pg_outbox_events_published_total", "sink" => sink, "source" => source.clone()),
+            retryable: errors("retryable"),
+            permanent: errors("permanent"),
+            dead_letters: metrics::counter!("pg_outbox_dead_letters_total", "source" => source.clone()),
+            latency: metrics::histogram!("pg_outbox_publish_latency_seconds", "source" => source.clone()),
+            channel_depth: metrics::gauge!("pg_outbox_channel_depth", "source" => source),
+        };
+        // Exported from the start, so dashboards show 0 instead of "no data".
+        for counter in [
+            &metrics.published,
+            &metrics.retryable,
+            &metrics.permanent,
+            &metrics.dead_letters,
+        ] {
+            counter.increment(0);
+        }
+        metrics
+    }
+}
+
 struct Core<K, D> {
     sink: K,
     dead_letters: D,
+    metrics: Metrics,
     batching: Batching,
     retry: Retry,
     health: Arc<Health>,
@@ -123,7 +154,7 @@ impl<K: EventSink, D: DeadLetterStore> Core<K, D> {
         let mut deadline: Option<Instant> = None;
 
         loop {
-            metrics::gauge!("pg_outbox_channel_depth").set(rx.len() as f64);
+            self.metrics.channel_depth.set(rx.len() as f64);
 
             let waited_enough = deadline.is_some_and(|d| d <= Instant::now());
             if buffer.len() >= self.batching.max_events || waited_enough {
@@ -177,13 +208,11 @@ impl<K: EventSink, D: DeadLetterStore> Core<K, D> {
             for (event, result) in pending.into_iter().zip(results) {
                 match result {
                     Ok(()) => {
-                        metrics::counter!("pg_outbox_events_published_total", "sink" => K::NAME)
-                            .increment(1);
+                        self.metrics.published.increment(1);
                         let latency = SystemTime::now()
                             .duration_since(event.committed_at)
                             .unwrap_or_default();
-                        metrics::histogram!("pg_outbox_publish_latency_seconds")
-                            .record(latency.as_secs_f64());
+                        self.metrics.latency.record(latency.as_secs_f64());
                         self.checkpoint.confirm(event.commit_lsn);
                     }
                     Err(PublishError::Permanent(reason)) => {
@@ -194,15 +223,13 @@ impl<K: EventSink, D: DeadLetterStore> Core<K, D> {
                             envelope = %event.envelope(),
                             "event rejected permanently, moving it to the dead-letter table"
                         );
-                        metrics::counter!("pg_outbox_publish_errors_total", "sink" => K::NAME, "kind" => "permanent")
-                            .increment(1);
-                        metrics::counter!("pg_outbox_dead_letters_total").increment(1);
+                        self.metrics.permanent.increment(1);
+                        self.metrics.dead_letters.increment(1);
                         self.dead_letter(&event, &reason).await;
                         self.checkpoint.confirm(event.commit_lsn);
                     }
                     Err(PublishError::Retryable(reason)) => {
-                        metrics::counter!("pg_outbox_publish_errors_total", "sink" => K::NAME, "kind" => "retryable")
-                            .increment(1);
+                        self.metrics.retryable.increment(1);
                         last_error = reason;
                         failed.push(event);
                     }

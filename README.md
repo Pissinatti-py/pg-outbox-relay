@@ -454,16 +454,20 @@ The relay reads a TOML file (first argument, default `./relay.toml`), then envir
 
 | Metric | Type | Use it for |
 |---|---|---|
-| `pg_outbox_events_published_total{sink}` | counter | Throughput |
-| `pg_outbox_publish_errors_total{sink,kind}` | counter | Broker health. `kind` is `retryable` or `permanent` |
-| `pg_outbox_publish_latency_seconds` | histogram | Commit → broker acknowledgement |
-| `pg_outbox_slot_lag_bytes` | gauge | **The main alert signal:** WAL the slot holds back |
-| `pg_outbox_dead_letters_total` | counter | Events rejected for good (stored in `outbox_dead_letter`) |
-| `pg_outbox_channel_depth` | gauge | Backpressure: near 1024 means the broker is the bottleneck |
+| `pg_outbox_events_published_total{sink,source}` | counter | Throughput |
+| `pg_outbox_publish_errors_total{sink,kind,source}` | counter | Broker health. `kind` is `retryable` or `permanent` |
+| `pg_outbox_publish_latency_seconds{source}` | histogram | Commit → broker acknowledgement |
+| `pg_outbox_slot_lag_bytes{source}` | gauge | **The main alert signal:** WAL the slot holds back |
+| `pg_outbox_source_up{source}` | gauge | 1 while this relay streams the source's slot. `sum by (source)` across replicas shows whether anyone does |
+| `pg_outbox_dead_letters_total{source}` | counter | Events rejected for good (stored in `outbox_dead_letter`) |
+| `pg_outbox_channel_depth{source}` | gauge | Backpressure: near 1024 means the broker is the bottleneck |
 
-**Alerts:** [`deploy/prometheus/alerts.yml`](deploy/prometheus/alerts.yml) ships four rules:
+`source` is the database the relay reads, and `sink` the broker (`sqs`, `sns` or `redis`).
+
+**Alerts:** [`deploy/prometheus/alerts.yml`](deploy/prometheus/alerts.yml) ships five rules, each per source where it applies:
 - `OutboxSlotLagHigh`;
 - `OutboxRelayDown`, because while the relay is down its lag metric disappears but the slot keeps growing;
+- `OutboxSourceDown`, when no relay streams a source (its database is down or its slot is missing);
 - `OutboxPublishStalled`;
 - `OutboxPoisonEvents`.
 

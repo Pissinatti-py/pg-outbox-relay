@@ -37,6 +37,7 @@ async fn relays_outbox_inserts_to_a_fifo_queue_in_per_aggregate_order() -> anyho
     )
     .await?;
     let relay = tokio::spawn(relay::run(
+        "postgres",
         source,
         sink,
         PgDeadLetters::new(&pg.config())?,
@@ -80,10 +81,24 @@ async fn relays_outbox_inserts_to_a_fifo_queue_in_per_aggregate_order() -> anyho
 
     // The relay acknowledged everything back to the slot.
     pg.wait_until_acked().await?;
-    // The slot-lag poller's SQL connection works over TLS too.
+    // Every metric is labelled with its source, and the slot-lag poller's SQL connection
+    // works over TLS too.
+    let rendered = metrics.render();
+    let exported = |metric: &str, value: &str| {
+        rendered.lines().any(|line| {
+            line.starts_with(metric)
+                && line.contains(r#"source="postgres""#)
+                && line.ends_with(value)
+        })
+    };
     assert!(
-        metrics.render().contains("pg_outbox_slot_lag_bytes"),
-        "no slot lag exported over TLS"
+        exported("pg_outbox_events_published_total", " 60"),
+        "{rendered}"
+    );
+    assert!(exported("pg_outbox_source_up", " 1"), "{rendered}");
+    assert!(
+        exported("pg_outbox_slot_lag_bytes", ""),
+        "no slot lag exported over TLS: {rendered}"
     );
     Ok(())
 }

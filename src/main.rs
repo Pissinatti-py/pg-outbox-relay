@@ -43,6 +43,7 @@ async fn run() -> anyhow::Result<()> {
     let health = Arc::new(Health::default());
     let (stop, stopped) = watch::channel(false);
 
+    let name = config.source.database()?;
     let dead_letters = PgDeadLetters::new(&config.source)?;
     let source = PgSource::new(config.source, health.clone(), stopped);
     let relay = async {
@@ -51,15 +52,15 @@ async fn run() -> anyhow::Result<()> {
         match config.sink {
             SinkConfig::Sqs(sqs) => {
                 let sink = SqsSink::connect(sqs).await?;
-                relay::run(source, sink, dead_letters, batching, retry, health).await
+                relay::run(&name, source, sink, dead_letters, batching, retry, health).await
             }
             SinkConfig::Sns(sns) => {
                 let sink = SnsSink::connect(sns).await?;
-                relay::run(source, sink, dead_letters, batching, retry, health).await
+                relay::run(&name, source, sink, dead_letters, batching, retry, health).await
             }
             SinkConfig::Redis(redis) => {
                 let sink = RedisSink::connect(redis).await?;
-                relay::run(source, sink, dead_letters, batching, retry, health).await
+                relay::run(&name, source, sink, dead_letters, batching, retry, health).await
             }
         }
     };

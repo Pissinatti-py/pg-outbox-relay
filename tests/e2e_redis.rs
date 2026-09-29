@@ -40,6 +40,7 @@ async fn relays_outbox_inserts_to_one_stream_per_aggregate_type() -> anyhow::Res
     .await?;
     let dead_letters = PgDeadLetters::new(&config)?;
     let relay = tokio::spawn(relay::run(
+        "postgres",
         source,
         sink,
         dead_letters,
