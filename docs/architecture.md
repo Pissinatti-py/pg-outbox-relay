@@ -109,7 +109,9 @@ The core may use two facades, much like `log`: `tracing` for logs and `metrics` 
 | Unit: adapter logic (pgoutput fixtures captured from Postgres 17, DSN, SQS mapping and splitting, config) | `#[cfg(test)]` in `src/adapters/*`, `src/config.rs` | `cargo test` | nothing |
 | Core behavior through the ports, with fakes and paused time | `tests/relay.rs` | `cargo test` | nothing |
 | Dependency rule | `tests/architecture.rs` | `cargo test` | nothing |
-| End to end: Postgres 17 → relay → SQS API (ElasticMQ) | `tests/e2e_sqs.rs` | `cargo test -- --ignored` | Docker |
+| End to end: Postgres 17 over TLS → relay → SQS API (ElasticMQ) | `tests/e2e_sqs.rs` | `cargo test -- --ignored` | Docker |
+| The Postgres adapter against a real database: the dead-letter table and its startup check | `tests/e2e_postgres.rs` | `cargo test -- --ignored` | Docker |
+| The relay binary under signals: SIGTERM drains without replays, a second signal ends a stuck drain, SIGKILL loses nothing | `tests/crash.rs` | `cargo test -- --ignored` | Docker |
 
 The e2e test uses ElasticMQ, a local SQS, because LocalStack now needs an account token. ElasticMQ does not enforce SQS's message-size limit, so the oversized-event path is covered by unit tests only; verify it against real SQS.
 

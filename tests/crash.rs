@@ -1,4 +1,5 @@
-//! The relay binary under signals, the way an orchestrator runs it.
+//! The relay binary under signals, the way an orchestrator runs it: SIGTERM drains,
+//! SIGKILL loses nothing.
 //! Needs Docker: `cargo test -- --ignored`.
 
 mod common;
@@ -38,6 +39,13 @@ impl RelayProcess {
             .args(["-TERM", &self.0.id().to_string()])
             .status()?;
         anyhow::ensure!(sent.success(), "kill -TERM failed");
+        Ok(())
+    }
+
+    /// No chance to clean up.
+    fn kill(&mut self) -> anyhow::Result<()> {
+        self.0.kill()?;
+        self.0.wait()?;
         Ok(())
     }
 
@@ -160,5 +168,65 @@ async fn a_second_signal_stops_a_drain_stuck_on_a_dead_broker() -> anyhow::Resul
     )
     .await?;
     assert_eq!(common::ids(&received), inserted);
+    Ok(())
+}
+
+#[tokio::test]
+#[ignore = "needs Docker"]
+async fn sigkill_mid_stream_loses_nothing() -> anyhow::Result<()> {
+    let pg = common::postgres().await?;
+    let (elasticmq, endpoint) = common::elasticmq().await?;
+    let sqs = aws_sdk_sqs::Client::new(&common::aws(&endpoint).await);
+    let queue_url = common::create_queue(&sqs, "events").await?;
+    let mut received = Vec::new();
+
+    // Hard kills with writes in flight. 50-row transactions over 50 aggregates span
+    // several batches: the case M1 could lose.
+    for round in 0..2 {
+        let mut relay = RelayProcess::start(&pg, &queue_url, &endpoint)?;
+        pg.insert(round * 500, 500, 50, 50).await?;
+        let seen = received.len();
+        common::receive(
+            &sqs,
+            &queue_url,
+            &mut received,
+            |r| r.len() >= seen + 100,
+            Duration::from_secs(30),
+        )
+        .await?;
+        relay.kill()?;
+    }
+
+    // The hardest case: the relay has read whole transactions it cannot publish, then dies.
+    let mut relay = RelayProcess::start(&pg, &queue_url, &endpoint)?;
+    let so_far = pg.ids().await?;
+    common::receive(
+        &sqs,
+        &queue_url,
+        &mut received,
+        |r| common::ids(r) == so_far,
+        Duration::from_secs(60),
+    )
+    .await?;
+    elasticmq.pause().await?;
+    pg.insert(1_000, 100, 20, 5).await?;
+    // Longer than the ack interval: an ack that ran ahead of publishing would reach Postgres.
+    sleep(Duration::from_secs(3)).await;
+    relay.kill()?;
+    elasticmq.unpause().await?;
+
+    let _relay = RelayProcess::start(&pg, &queue_url, &endpoint)?;
+    let inserted = pg.ids().await?;
+    common::receive(
+        &sqs,
+        &queue_url,
+        &mut received,
+        |r| common::ids(r) == inserted,
+        Duration::from_secs(90),
+    )
+    .await?;
+    let missing = inserted.difference(&common::ids(&received)).count();
+    assert_eq!(missing, 0, "{missing} events lost");
+    // Duplicates are allowed; each one repeats an id that was already delivered.
     Ok(())
 }

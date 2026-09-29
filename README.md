@@ -489,7 +489,7 @@ Prerequisites: Rust 1.94.1 or newer (the AWS SDK sets that minimum) and Docker f
 
 ```bash
 cargo test                          # unit, core and architecture tests: fast, no Docker
-cargo test -- --ignored             # end to end: Postgres 17 → relay → SQS API (ElasticMQ)
+cargo test -- --ignored             # end to end (SQS, dead letters) and the crash tests: the relay binary under SIGTERM and SIGKILL
 cargo fmt --check && cargo clippy --all-targets -- -D warnings
 cargo run -- relay.toml             # against your own Postgres and SQS
 ```
@@ -504,7 +504,7 @@ src/
 ├── adapters/    postgres/ (replication + pgoutput), sqs.rs, http.rs
 ├── config.rs    TOML + RELAY__ env → every layer's settings
 └── main.rs      composition root
-tests/           relay.rs (core, with fakes), architecture.rs, e2e_sqs.rs (Docker)
+tests/           relay.rs (core, with fakes), architecture.rs; Docker: e2e_*.rs, crash.rs, common/
 sql/             outbox table + publication, replication slot
 deploy/          demo configs: Postgres init, ElasticMQ, Prometheus + alerts, Grafana
 docs/            architecture.md, adr/, spec.md (the original design)
