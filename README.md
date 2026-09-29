@@ -227,6 +227,7 @@ If the transaction rolls back, the event never existed. If it commits, it will b
 Each SQS message body is the envelope shown in the [Quickstart](#quickstart-5-minutes). Keep these in mind:
 - **Deduplicate on `id`.** Delivery is at-least-once. A FIFO queue drops duplicates within its 5-minute deduplication window. Beyond that, record processed ids, for example with a processed-events table or a Redis `SET NX`.
 - **FIFO queues** deliver each aggregate's events in commit order (`MessageGroupId = aggregate_type:aggregate_id`). **Standard queues** also work but do not keep order; the `id` is available as a message attribute there too.
+- **SNS:** subscribe queues with raw message delivery, so the body is the envelope. `id` and `event_type` are message attributes, usable in subscription filter policies. A `.fifo` topic keeps the same per-aggregate order and delivers to `.fifo` queues.
 - **Rows can be deleted** once they are published, for example with a nightly job that deletes rows older than 7 days, or with daily partitions you drop. The WAL already carried them. If you partition `outbox`, create the publication `WITH (publish = 'insert', publish_via_partition_root = true)`.
 
 ## Examples
@@ -400,7 +401,12 @@ Each relay reads the same publication and acknowledges its own slot:
 - **Independence:** a slow indexer never delays notifications.
 - **Cost:** each slot also keeps WAL until its own relay catches up, so watch `pg_outbox_slot_lag_bytes` for every relay.
 
-The SNS sink in M2 turns fan-out into one relay and a topic.
+Or publish to an SNS topic instead: one relay and one slot, and each service subscribes its own queue (raw message delivery on), with a filter policy on `event_type` if it only needs some events.
+
+```bash
+RELAY__SINK__KIND=sns
+RELAY__SINK__TOPIC_ARN=arn:aws:sns:us-east-1:123456789012:products.fifo
+```
 
 **Building the index the first time.** A slot streams changes from the moment it's created; it isn't a backfill tool. Build the initial index from the `products` table, then let the relay keep it current. The version check makes any overlap between the two harmless.
 
@@ -413,15 +419,16 @@ The relay reads a TOML file (first argument, default `./relay.toml`), then envir
 | `source.dsn` | `RELAY__SOURCE__DSN` | required | `postgres://user:password@host:5432/db?sslmode=verify-full&sslrootcert=/ca.pem`. `sslmode`: `disable`, `prefer` (default), `require`, `verify-ca`, `verify-full`. It applies to every connection: replication, slot lag and dead letters |
 | `source.slot` | `RELAY__SOURCE__SLOT` | required | Replication slot, for example `outbox_relay` |
 | `source.publication` | `RELAY__SOURCE__PUBLICATION` | required | Publication, for example `outbox_pub` |
-| `sink.kind` | `RELAY__SINK__KIND` | required | `sqs` |
-| `sink.queue_url` | `RELAY__SINK__QUEUE_URL` | required | A `.fifo` URL enables ordering and deduplication |
+| `sink.kind` | `RELAY__SINK__KIND` | required | `sqs` or `sns` |
+| `sink.queue_url` | `RELAY__SINK__QUEUE_URL` | required for `sqs` | A `.fifo` URL enables ordering and deduplication |
+| `sink.topic_arn` | `RELAY__SINK__TOPIC_ARN` | required for `sns` | A `.fifo` ARN enables ordering and deduplication |
 | `batching.max_events` | `RELAY__BATCHING__MAX_EVENTS` | `10` | Events per publish |
 | `batching.max_wait_ms` | `RELAY__BATCHING__MAX_WAIT_MS` | `20` | How long a lone event waits for company |
 | `retry.initial_backoff_ms` | `RELAY__RETRY__INITIAL_BACKOFF_MS` | `100` | First retry delay (jittered) |
 | `retry.max_backoff_ms` | `RELAY__RETRY__MAX_BACKOFF_MS` | `30000` | Retry delay cap. Broker errors retry forever |
 | `server.listen` | `RELAY__SERVER__LISTEN` | `0.0.0.0:9090` | `/metrics`, `/healthz`, `/readyz` |
 
-**AWS credentials and region** come from the standard AWS chain: environment variables, profile, or an IAM role such as IRSA or an ECS task role. To point the relay at a local SQS, set `AWS_ENDPOINT_URL`. The relay needs `sqs:SendMessage` and `sqs:GetQueueAttributes` on the queue.
+**AWS credentials and region** come from the standard AWS chain: environment variables, profile, or an IAM role such as IRSA or an ECS task role. To point the relay at a local SQS or SNS, set `AWS_ENDPOINT_URL`. The relay needs `sqs:SendMessage` and `sqs:GetQueueAttributes` on the queue, or `sns:Publish` and `sns:GetTopicAttributes` on the topic.
 
 **Logs** are JSON on stdout. `RUST_LOG` overrides the level (default `info`).
 
@@ -489,7 +496,7 @@ Prerequisites: Rust 1.94.1 or newer (the AWS SDK sets that minimum) and Docker f
 
 ```bash
 cargo test                          # unit, core and architecture tests: fast, no Docker
-cargo test -- --ignored             # end to end (SQS, dead letters) and the crash tests: the relay binary under SIGTERM and SIGKILL
+cargo test -- --ignored             # end to end (SQS, SNS, dead letters) and the crash tests: the relay binary under SIGTERM and SIGKILL
 cargo fmt --check && cargo clippy --all-targets -- -D warnings
 cargo run -- relay.toml             # against your own Postgres and SQS
 ```

@@ -5,6 +5,7 @@ use std::sync::Arc;
 
 use pg_outbox_relay::adapters::http;
 use pg_outbox_relay::adapters::postgres::{PgDeadLetters, PgSource};
+use pg_outbox_relay::adapters::sns::SnsSink;
 use pg_outbox_relay::adapters::sqs::SqsSink;
 use pg_outbox_relay::app::{Health, relay};
 use pg_outbox_relay::config::{Config, SinkConfig};
@@ -44,18 +45,18 @@ async fn run() -> anyhow::Result<()> {
     let dead_letters = PgDeadLetters::new(&config.source)?;
     let source = PgSource::new(config.source, health.clone(), stopped);
     let relay = async {
-        let sink = match config.sink {
-            SinkConfig::Sqs(sqs) => SqsSink::connect(sqs).await?,
-        };
-        relay::run(
-            source,
-            sink,
-            dead_letters,
-            config.batching,
-            config.retry,
-            health.clone(),
-        )
-        .await
+        // One arm per sink: relay::run is compiled for each concrete sink, with no trait objects.
+        let (batching, retry, health) = (config.batching, config.retry, health.clone());
+        match config.sink {
+            SinkConfig::Sqs(sqs) => {
+                let sink = SqsSink::connect(sqs).await?;
+                relay::run(source, sink, dead_letters, batching, retry, health).await
+            }
+            SinkConfig::Sns(sns) => {
+                let sink = SnsSink::connect(sns).await?;
+                relay::run(source, sink, dead_letters, batching, retry, health).await
+            }
+        }
     };
     tokio::pin!(relay);
 

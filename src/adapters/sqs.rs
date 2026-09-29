@@ -169,10 +169,10 @@ fn entry(
     entry.build().expect("id and body are set")
 }
 
-/// SQS group and deduplication ids allow up to 128 printable ASCII characters. The mapping
+/// SQS and SNS group and deduplication ids allow up to 128 printable ASCII characters. The mapping
 /// is deterministic, so a clipped key can only merge groups (less parallelism), never
 /// split an aggregate across groups (lost ordering).
-fn sqs_id(value: &str) -> String {
+pub(super) fn sqs_id(value: &str) -> String {
     value
         .chars()
         .map(|c| if c.is_ascii_graphic() { c } else { '_' })
@@ -180,14 +180,14 @@ fn sqs_id(value: &str) -> String {
         .collect()
 }
 
-/// Bytes SQS counts for an entry: the body plus its message attributes, with some slack.
-fn size(event: &OutboxEvent, body: &str) -> usize {
+/// Bytes SQS and SNS count for an entry: the body plus its message attributes, with some slack.
+pub(super) fn size(event: &OutboxEvent, body: &str) -> usize {
     body.len() + event.id.len() + event.event_type.len() + 64
 }
 
-/// Splits entries into calls within `SendMessageBatch` limits. An entry too large for
+/// Splits entries into calls within `SendMessageBatch` (and `PublishBatch`) limits. An entry too large for
 /// any call still gets one of its own, so SQS rejects only that entry.
-fn batches(sizes: &[usize]) -> Vec<Range<usize>> {
+pub(super) fn batches(sizes: &[usize]) -> Vec<Range<usize>> {
     let mut batches = Vec::new();
     let (mut start, mut bytes) = (0, 0);
     for (i, &size) in sizes.iter().enumerate() {
@@ -203,15 +203,17 @@ fn batches(sizes: &[usize]) -> Vec<Range<usize>> {
     batches
 }
 
-/// Only content SQS will never accept is permanent. Other entry errors are retried, even
-/// with `sender_fault` set (e.g. KMS permissions): a stall is visible and loses nothing,
-/// while skipping would silently drop events.
-fn classify(sender_fault: bool, code: &str, message: &str) -> PublishError {
-    const CONTENT_ERRORS: [&str; 4] = [
+/// Only content SQS or SNS will never accept is permanent. Other entry errors are retried,
+/// even with `sender_fault` set (e.g. KMS permissions): a stall is visible and loses nothing,
+/// while skipping would silently drop events. The codes differ per service, so one list
+/// serves both: no SQS code ends in SNS's `InvalidParameter`.
+pub(super) fn classify(sender_fault: bool, code: &str, message: &str) -> PublishError {
+    const CONTENT_ERRORS: [&str; 5] = [
         "InvalidParameterValue",
         "InvalidMessageContents",
         "InvalidAttributeValue",
         "MessageTooLong",
+        "InvalidParameter", // SNS
     ];
     let reason = format!("{code}: {message}");
     if sender_fault && CONTENT_ERRORS.iter().any(|content| code.ends_with(content)) {
@@ -295,6 +297,11 @@ mod tests {
             true,
             "AWS.SimpleQueueService.InvalidMessageContents",
             ""
+        )));
+        assert!(permanent(classify(
+            true,
+            "InvalidParameter",
+            "Invalid parameter: Message too long"
         )));
         assert!(!permanent(classify(true, "KMS.AccessDeniedException", "")));
         assert!(!permanent(classify(false, "InternalError", "")));

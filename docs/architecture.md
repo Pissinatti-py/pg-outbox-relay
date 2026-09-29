@@ -11,7 +11,7 @@ For what the relay is and how to run it, see the [README](../README.md). The ori
 
 ```
             ┌──────────────── adapters (I/O) ─────────────────┐
-            │  postgres/ (source)   sqs (sink)   http (ops)   │
+            │  postgres/ (source)  sqs · sns (sinks)  http    │
             └───────┬─────────────────▲──────────────▲────────┘
                     │ implements      │ implements   │ reads
             ┌───────▼─────────────────┴──────────────┴────────┐
@@ -55,7 +55,8 @@ The core may use two facades, much like `log`: `tracing` for logs and `metrics` 
 | `src/adapters/postgres/mod.rs` | `PgSource`: connect/retry, the replication stream, acks, the slot-lag poller, DSN parsing, SQL connections over the same TLS | pgwire-replication, tokio-postgres |
 | `src/adapters/postgres/pgoutput.rs` | Decodes pgoutput `Relation` and `Insert`; maps a row to an `OutboxEvent` | domain |
 | `src/adapters/postgres/dead_letter.rs` | `PgDeadLetters`: stores rejected events in `outbox_dead_letter`; the startup check | tokio-postgres |
-| `src/adapters/sqs.rs` | `SqsSink`: envelope → `SendMessageBatch`, call splitting, error classification | aws-sdk-sqs |
+| `src/adapters/sqs.rs` | `SqsSink`: envelope → `SendMessageBatch`, call splitting, error classification (shared with SNS) | aws-sdk-sqs |
+| `src/adapters/sns.rs` | `SnsSink`: envelope → `PublishBatch`, reusing the SQS splitting, id mapping and classification | aws-sdk-sns |
 | `src/adapters/http.rs` | `/metrics`, `/healthz`, `/readyz` | axum, metrics-exporter-prometheus |
 | `src/config.rs` | TOML file + `RELAY__…` env overrides → each layer's own settings struct | config |
 | `src/main.rs` | Wires everything together; logging; signals | everything |
@@ -83,7 +84,7 @@ The core may use two facades, much like `log`: `tracing` for logs and `metrics` 
 | **At-least-once** | The checkpoint keeps a `BTreeMap<commit LSN, unconfirmed count>`. `safe_lsn` pops fully confirmed entries from the lowest LSN up, and only up to the last `Progress` the source sent, so a transaction split across batches is never acked early. It returns the last one popped, so the ack can never pass an unconfirmed event. A crash only loses unacked progress, which Postgres replays. | `domain/checkpoint.rs` | `checkpoint` unit tests; `a_crash_mid_batch_loses_nothing`; `a_transaction_split_across_batches_is_acked_only_once_complete`; e2e ack check |
 | **Idle slots advance** | With nothing pending, a `Progress` LSN (commit or keepalive) becomes the ack, the same as Postgres' own apply worker. Keepalives received mid-transaction are ignored, because their `wal_end` can sit before that transaction's commit. | `checkpoint.rs`, `postgres/mod.rs` | `idle_progress_advances_the_ack` |
 | **Per-aggregate order** | pgoutput delivers in commit order and the channel is FIFO. A batch holds at most one event per aggregate, and it finishes, retries included, before the next batch starts. So a partial failure cannot let a later event of an aggregate overtake an earlier one. | `domain/batch.rs`, `app/relay.rs` | `batch` unit tests; `retries_retryable_failures_without_reordering`; e2e order check |
-| **Idempotency key** | The outbox `id` becomes the SQS `MessageDeduplicationId` and an `id` message attribute. `MessageGroupId` is `aggregate_type:aggregate_id`, mapped to SQS's character set deterministically. | `adapters/sqs.rs` | `sqs` unit tests; e2e |
+| **Idempotency key** | The outbox `id` becomes the SQS or SNS `MessageDeduplicationId` and an `id` message attribute. `MessageGroupId` is `aggregate_type:aggregate_id`, mapped to their character set deterministically. | `adapters/sqs.rs`, `adapters/sns.rs` | `sqs` and `sns` unit tests; e2e |
 | **Backpressure** | The core stops reading when a batch is due, the channel fills up, and the source waits. | `app/relay.rs` | `a_stalled_sink_holds_the_source_back` |
 | **Clean stop without replays** | On SIGTERM the source stops reading between transactions and closes the channel. The core publishes what it was sent, and `relay::run` waits for the source to report the final ack. The source confirms the replication worker has sent it (`last_applied_lsn`) before closing the stream. | `postgres/mod.rs` (`stream`, `final_ack`), `app/relay.rs`, `main.rs` | `a_clean_stop_hands_the_final_ack_to_the_source`; `sigterm_drains_so_the_next_start_publishes_no_duplicates`; `a_second_signal_stops_a_drain_stuck_on_a_dead_broker` |
 | **No poison-pill stall** | Only rejected *content* is `Permanent`. Call-level failures and unknown entry errors are retried, so a stall is visible and loses nothing. A rejected event is stored before it is confirmed, so the ack never passes an event that is nowhere. | `adapters/sqs.rs` (`classify`), `app/relay.rs` (`dead_letter`) | `dead_letters_a_permanently_rejected_event_and_moves_on`; `a_rejected_event_is_not_acked_until_it_is_dead_lettered`; `classify` tests; `e2e_postgres` |
@@ -110,6 +111,7 @@ The core may use two facades, much like `log`: `tracing` for logs and `metrics` 
 | Core behavior through the ports, with fakes and paused time | `tests/relay.rs` | `cargo test` | nothing |
 | Dependency rule | `tests/architecture.rs` | `cargo test` | nothing |
 | End to end: Postgres 17 over TLS → relay → SQS API (ElasticMQ) | `tests/e2e_sqs.rs` | `cargo test -- --ignored` | Docker |
+| End to end: Postgres 17 → relay → SNS FIFO topic → SQS FIFO queue (moto) | `tests/e2e_sns.rs` | `cargo test -- --ignored` | Docker |
 | The Postgres adapter against a real database: the dead-letter table and its startup check | `tests/e2e_postgres.rs` | `cargo test -- --ignored` | Docker |
 | The relay binary under signals: SIGTERM drains without replays, a second signal ends a stuck drain, SIGKILL loses nothing | `tests/crash.rs` | `cargo test -- --ignored` | Docker |
 
@@ -117,12 +119,12 @@ The e2e test uses ElasticMQ, a local SQS, because LocalStack now needs an accoun
 
 ## Adding a sink
 
-For example, SNS in M2:
-1. Create `src/adapters/sns.rs` with a `SnsConfig` (serde) and a `SnsSink` implementing `EventSink`:
-   - `const NAME: &'static str = "sns";`
+For a new broker `x` (`sns.rs` is a compact example):
+1. Create `src/adapters/x.rs` with an `XConfig` (serde) and an `XSink` implementing `EventSink`:
+   - `const NAME: &'static str = "x";`
    - `publish` returns **one result per event, in order**. Classify errors conservatively: only content the broker will never accept is `Permanent`.
-2. Add `Sns(SnsConfig)` to `SinkConfig` in `src/config.rs`.
-3. Add the `SinkConfig::Sns` arm in `src/main.rs`. Each arm calls `relay::run` with a concrete type, so there are no trait objects.
+2. Add `X(XConfig)` to `SinkConfig` in `src/config.rs`.
+3. Add the `SinkConfig::X` arm in `src/main.rs`. Each arm calls `relay::run` with a concrete type, so there are no trait objects.
 4. Unit-test the mapping (envelope → broker request, ordering and dedup keys, splitting, error classification) inside the adapter.
 5. Add `tests/e2e_<sink>.rs`, marked `#[ignore = "needs Docker"]`.
 

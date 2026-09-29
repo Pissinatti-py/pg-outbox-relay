@@ -9,6 +9,7 @@ license = "MIT OR Apache-2.0"
 [dependencies]
 anyhow = "1.0.104"
 aws-config = { version = "1.12.0", features = ["behavior-version-latest"] }
+aws-sdk-sns = "1.115.0"
 aws-sdk-sqs = "1.113.0"
 axum = "0.8.9"
 config = { version = "0.15.26", default-features = false, features = ["toml"] }
