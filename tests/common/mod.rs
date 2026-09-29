@@ -75,6 +75,7 @@ impl Pg {
             ),
             slot: SLOT.into(),
             publication: "outbox_pub".into(),
+            databases: Vec::new(),
         }
     }
 

@@ -4,13 +4,14 @@
 mod dead_letter;
 mod pgoutput;
 
+use std::collections::HashSet;
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::atomic::Ordering;
 use std::time::Duration;
 
 use anyhow::{Context, anyhow, bail, ensure};
-use percent_encoding::percent_decode_str;
+use percent_encoding::{NON_ALPHANUMERIC, percent_decode_str, utf8_percent_encode};
 use pgwire_replication::client::ReplicationEvent;
 use pgwire_replication::tls::rustls::maybe_upgrade_to_tls;
 use pgwire_replication::{PgWireError, ReplicationClient, ReplicationConfig, SslMode, TlsConfig};
@@ -38,7 +39,14 @@ pub struct PgConfig {
     pub dsn: String,
     pub slot: String,
     pub publication: String,
+    /// Relay these databases, one pipeline each; `{database}` in `dsn` and `slot` stands
+    /// for each name.
+    #[serde(default)]
+    pub databases: Vec<String>,
 }
+
+/// Stands for each entry of `databases` in the DSN and slot templates.
+const PLACEHOLDER: &str = "{database}";
 
 pub struct PgSource {
     config: PgConfig,
@@ -52,6 +60,61 @@ impl PgConfig {
     pub fn database(&self) -> anyhow::Result<String> {
         Ok(Dsn::parse(&self.dsn)?.dbname)
     }
+
+    /// One concrete config per source: each entry of `databases`, or this config alone.
+    /// Checked up front, so a bad entry fails the start instead of one pipeline.
+    pub fn sources(&self) -> anyhow::Result<Vec<PgConfig>> {
+        if self.databases.is_empty() {
+            ensure!(
+                !self.dsn.contains(PLACEHOLDER) && !self.slot.contains(PLACEHOLDER),
+                "source.dsn or source.slot contain {PLACEHOLDER}, but source.databases is empty"
+            );
+            check_slot_name(&self.slot)?;
+            Dsn::parse(&self.dsn)?;
+            return Ok(vec![self.clone()]);
+        }
+        ensure!(
+            self.dsn.contains(PLACEHOLDER),
+            "source.dsn must contain {PLACEHOLDER} when source.databases is set"
+        );
+        ensure!(
+            self.slot.contains(PLACEHOLDER),
+            "source.slot must contain {PLACEHOLDER}: slot names are unique across the whole server"
+        );
+        let mut seen = HashSet::new();
+        self.databases
+            .iter()
+            .map(|database| {
+                ensure!(
+                    seen.insert(database),
+                    "source.databases lists {database} twice"
+                );
+                let encoded = utf8_percent_encode(database, NON_ALPHANUMERIC).to_string();
+                let source = PgConfig {
+                    dsn: self.dsn.replace(PLACEHOLDER, &encoded),
+                    slot: self.slot.replace(PLACEHOLDER, database),
+                    publication: self.publication.clone(),
+                    databases: Vec::new(),
+                };
+                check_slot_name(&source.slot).with_context(|| format!("database {database}"))?;
+                Dsn::parse(&source.dsn)?;
+                Ok(source)
+            })
+            .collect()
+    }
+}
+
+/// Postgres slot names: lowercase letters, digits and underscores, at most 63 bytes.
+fn check_slot_name(slot: &str) -> anyhow::Result<()> {
+    ensure!(
+        !slot.is_empty()
+            && slot.len() <= 63
+            && slot
+                .bytes()
+                .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'_'),
+        "`{slot}` is not a valid slot name: use lowercase letters, digits and underscores (at most 63)"
+    );
+    Ok(())
 }
 
 impl PgSource {
@@ -415,6 +478,73 @@ mod tests {
         assert_eq!(dsn.port, 5432);
         assert_eq!(dsn.sslmode, SslMode::Prefer);
         assert_eq!(dsn.password, "");
+    }
+
+    fn config(dsn: &str, slot: &str, databases: &[&str]) -> PgConfig {
+        PgConfig {
+            dsn: dsn.into(),
+            slot: slot.into(),
+            publication: "outbox_pub".into(),
+            databases: databases.iter().map(|name| name.to_string()).collect(),
+        }
+    }
+
+    #[test]
+    fn one_source_per_database_from_the_templates() {
+        let sources = config(
+            "postgres://relay:pw@db:5432/{database}?sslmode=require",
+            "outbox_{database}",
+            &["acme", "acme_corp"],
+        )
+        .sources()
+        .unwrap();
+        let got: Vec<(String, String)> = sources
+            .iter()
+            .map(|s| (s.database().unwrap(), s.slot.clone()))
+            .collect();
+        assert_eq!(
+            got,
+            [
+                ("acme".to_owned(), "outbox_acme".to_owned()),
+                ("acme_corp".to_owned(), "outbox_acme_corp".to_owned()),
+            ]
+        );
+        assert!(
+            sources
+                .iter()
+                .all(|s| s.dsn.ends_with("?sslmode=require") && s.databases.is_empty())
+        );
+    }
+
+    #[test]
+    fn without_databases_the_config_is_its_own_single_source() {
+        let sources = config("postgres://relay@db/app", "outbox_relay", &[])
+            .sources()
+            .unwrap();
+        assert_eq!(sources.len(), 1);
+        assert_eq!(sources[0].database().unwrap(), "app");
+        assert_eq!(sources[0].slot, "outbox_relay");
+    }
+
+    #[test]
+    fn rejects_database_lists_that_cannot_work() {
+        let dsn = "postgres://relay@db/{database}";
+        for (bad, why) in [
+            (
+                config("postgres://relay@db/app", "outbox_{database}", &["acme"]),
+                "{database}",
+            ),
+            (config(dsn, "outbox_relay", &["acme"]), "server"),
+            (config(dsn, "outbox_{database}", &["acme", "acme"]), "twice"),
+            (
+                config(dsn, "outbox_{database}", &["acme-corp"]),
+                "acme-corp",
+            ),
+            (config(dsn, "outbox_{database}", &[]), "databases"),
+        ] {
+            let error = bad.sources().unwrap_err();
+            assert!(format!("{error:#}").contains(why), "{error:#}");
+        }
     }
 
     #[test]

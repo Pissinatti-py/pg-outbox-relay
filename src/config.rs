@@ -59,6 +59,8 @@ impl Config {
             .prefix_separator("__")
             .separator("__")
             .try_parsing(true)
+            .list_separator(",")
+            .with_list_parse_key("source.databases")
             .source(env);
         let config = config::Config::builder()
             .add_source(File::new(path, FileFormat::Toml).required(false))
@@ -165,6 +167,26 @@ mod tests {
         };
         assert_eq!(redis.url, "redis://cache:6379");
         assert_eq!(redis.stream_prefix, "outbox:");
+    }
+
+    #[test]
+    fn the_environment_lists_databases() {
+        let config = Config::from(
+            "does-not-exist.toml",
+            env(&[
+                ("RELAY__SOURCE__DSN", "postgres://relay@db/{database}"),
+                ("RELAY__SOURCE__SLOT", "outbox_{database}"),
+                ("RELAY__SOURCE__PUBLICATION", "outbox_pub"),
+                ("RELAY__SOURCE__DATABASES", "acme,globex"),
+                ("RELAY__SINK__KIND", "sqs"),
+                (
+                    "RELAY__SINK__QUEUE_URL",
+                    "https://sqs.us-east-1.amazonaws.com/1/e.fifo",
+                ),
+            ]),
+        )
+        .unwrap();
+        assert_eq!(config.source.databases, ["acme", "globex"]);
     }
 
     #[test]
