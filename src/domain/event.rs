@@ -20,6 +20,8 @@ impl fmt::Display for Lsn {
 pub struct OutboxEvent {
     /// Idempotency key: consumers deduplicate on it.
     pub id: String,
+    /// The database the event was committed in.
+    pub source: String,
     pub aggregate_type: String,
     pub aggregate_id: String,
     pub event_type: String,
@@ -37,7 +39,10 @@ pub struct OutboxEvent {
 impl OutboxEvent {
     /// Events sharing this key reach the broker in commit order.
     pub fn ordering_key(&self) -> String {
-        format!("{}:{}", self.aggregate_type, self.aggregate_id)
+        format!(
+            "{}:{}:{}",
+            self.source, self.aggregate_type, self.aggregate_id
+        )
     }
 
     /// The JSON document consumers receive.
@@ -45,6 +50,7 @@ impl OutboxEvent {
         #[derive(Serialize)]
         struct Envelope<'a> {
             id: &'a str,
+            source: &'a str,
             aggregate_type: &'a str,
             aggregate_id: &'a str,
             event_type: &'a str,
@@ -54,6 +60,7 @@ impl OutboxEvent {
         }
         serde_json::to_string(&Envelope {
             id: &self.id,
+            source: &self.source,
             aggregate_type: &self.aggregate_type,
             aggregate_id: &self.aggregate_id,
             event_type: &self.event_type,
@@ -88,6 +95,7 @@ mod tests {
     fn envelope_has_the_documented_shape() {
         let event = OutboxEvent {
             id: "0b7e5c1e-2f4a-4c33-9d7e-9a4f1c2b3d4e".into(),
+            source: "acme".into(),
             aggregate_type: "policy".into(),
             aggregate_id: "42".into(),
             event_type: "policy.approved".into(),
@@ -98,10 +106,10 @@ mod tests {
             committed_at: SystemTime::UNIX_EPOCH,
         };
 
-        assert_eq!(event.ordering_key(), "policy:42");
+        assert_eq!(event.ordering_key(), "acme:policy:42");
         assert_eq!(
             event.envelope(),
-            r#"{"id":"0b7e5c1e-2f4a-4c33-9d7e-9a4f1c2b3d4e","aggregate_type":"policy","aggregate_id":"42","event_type":"policy.approved","occurred_at":"2026-09-28T14:03:11Z","headers":{"tenant": "acme"},"payload":{"policy_id": 42}}"#
+            r#"{"id":"0b7e5c1e-2f4a-4c33-9d7e-9a4f1c2b3d4e","source":"acme","aggregate_type":"policy","aggregate_id":"42","event_type":"policy.approved","occurred_at":"2026-09-28T14:03:11Z","headers":{"tenant": "acme"},"payload":{"policy_id": 42}}"#
         );
     }
 }

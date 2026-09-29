@@ -73,9 +73,10 @@ impl Decoder {
     }
 }
 
-/// Builds the event for an outbox row committed at `commit_lsn`.
+/// Builds the event for an outbox row of database `source`, committed at `commit_lsn`.
 pub fn outbox_event(
     mut row: Row,
+    source: &str,
     commit_lsn: Lsn,
     committed_at: SystemTime,
 ) -> anyhow::Result<OutboxEvent> {
@@ -86,6 +87,7 @@ pub fn outbox_event(
     };
     Ok(OutboxEvent {
         id: take("id")?,
+        source: source.to_owned(),
         aggregate_type: take("aggregate_type")?,
         aggregate_id: take("aggregate_id")?,
         event_type: take("event_type")?,
@@ -202,9 +204,10 @@ mod tests {
         let mut decoder = Decoder::default();
         assert!(decoder.decode(&hex(RELATION)).unwrap().is_none());
         let row = decoder.decode(&hex(INSERT)).unwrap().unwrap();
-        let event = outbox_event(row, Lsn(7), pg_time(0)).unwrap();
+        let event = outbox_event(row, "acme", Lsn(7), pg_time(0)).unwrap();
 
         assert_eq!(event.id, "7c9e6679-7425-40de-944b-e07fc1f90ae7");
+        assert_eq!(event.source, "acme");
         assert_eq!(event.aggregate_type, "policy");
         assert_eq!(event.aggregate_id, "42");
         assert_eq!(event.event_type, "policy.approved");
@@ -239,7 +242,7 @@ mod tests {
             Some("abc"),
         ];
         let row = decoder.decode(&insert(9, &values)).unwrap().unwrap();
-        let event = outbox_event(row, Lsn(1), pg_time(0)).unwrap();
+        let event = outbox_event(row, "acme", Lsn(1), pg_time(0)).unwrap();
 
         assert_eq!(event.id, "abc");
         assert_eq!(event.aggregate_type, "x");
@@ -257,7 +260,7 @@ mod tests {
             .decode(&insert(9, &[Some("a"), Some("b"), Some("c")]))
             .unwrap()
             .unwrap();
-        let error = outbox_event(row, Lsn(1), pg_time(0)).unwrap_err();
+        let error = outbox_event(row, "acme", Lsn(1), pg_time(0)).unwrap_err();
         assert!(error.to_string().contains("event_type"), "{error}");
     }
 

@@ -235,7 +235,7 @@ pub fn ids(received: &[Received]) -> HashSet<String> {
 pub fn assert_ordered_per_aggregate(received: &[Received]) {
     let mut last = HashMap::new();
     for r in received {
-        let aggregate = r.envelope["aggregate_id"].as_str().unwrap().to_owned();
+        let aggregate = format!("{}:{}", r.envelope["source"], r.envelope["aggregate_id"]);
         let n = r.envelope["payload"]["n"].as_u64().unwrap();
         if let Some(previous) = last.insert(aggregate.clone(), n) {
             assert!(

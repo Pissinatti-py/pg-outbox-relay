@@ -63,7 +63,7 @@ async fn relays_outbox_inserts_to_a_fifo_queue_in_per_aggregate_order() -> anyho
     assert_eq!(common::ids(&received), pg.ids().await?);
     let first = &received[0];
     let group = format!(
-        "policy:{}",
+        "postgres:policy:{}",
         first.envelope["aggregate_id"].as_str().unwrap()
     );
     assert_eq!(first.group.as_deref(), Some(group.as_str()));

@@ -100,10 +100,10 @@ curl -s localhost:9324 \
        "MessageSystemAttributeNames": ["MessageGroupId"], "MessageAttributeNames": ["All"]}'
 ```
 
-The message body is the event envelope. `MessageGroupId` is `policy:42`, and the event `id` is also the FIFO deduplication id:
+The message body is the event envelope, and `source` is the database it was committed in. `MessageGroupId` is `app:policy:42`, and the event `id` is also the FIFO deduplication id:
 
 ```json
-{"id":"0fafad7a-fd18-4f77-a13e-3dd92bd7ac61","aggregate_type":"policy","aggregate_id":"42","event_type":"policy.approved","occurred_at":"2026-09-28T16:21:58.774339Z","headers":{"tenant": "acme"},"payload":{"policy_id": 42}}
+{"id":"0fafad7a-fd18-4f77-a13e-3dd92bd7ac61","source":"app","aggregate_type":"policy","aggregate_id":"42","event_type":"policy.approved","occurred_at":"2026-09-28T16:21:58.774339Z","headers":{"tenant": "acme"},"payload":{"policy_id": 42}}
 ```
 
 **3. Watch it:**
@@ -226,9 +226,9 @@ If the transaction rolls back, the event never existed. If it commits, it will b
 
 Each SQS message body is the envelope shown in the [Quickstart](#quickstart-5-minutes). Keep these in mind:
 - **Deduplicate on `id`.** Delivery is at-least-once. A FIFO queue drops duplicates within its 5-minute deduplication window. Beyond that, record processed ids, for example with a processed-events table or a Redis `SET NX`.
-- **FIFO queues** deliver each aggregate's events in commit order (`MessageGroupId = aggregate_type:aggregate_id`). **Standard queues** also work but do not keep order; the `id` is available as a message attribute there too.
-- **SNS:** subscribe queues with raw message delivery, so the body is the envelope. `id` and `event_type` are message attributes, usable in subscription filter policies. A `.fifo` topic keeps the same per-aggregate order and delivers to `.fifo` queues.
-- **Redis Streams:** each entry has `id`, `event_type` and `envelope` (the JSON above), in the stream `outbox:<aggregate_type>`. An aggregate's events stay in order within its stream. Read with `XREADGROUP` and deduplicate on `id`. The relay never trims: use `XTRIM <stream> MINID <id>` once every consumer group has passed an entry (`MAXLEN` drops entries a lagging group has not read).
+- **FIFO queues** deliver each aggregate's events in commit order (`MessageGroupId = source:aggregate_type:aggregate_id`). **Standard queues** also work but do not keep order; the `id` is available as a message attribute there too.
+- **SNS:** subscribe queues with raw message delivery, so the body is the envelope. `id`, `event_type` and `source` are message attributes, usable in subscription filter policies. A `.fifo` topic keeps the same per-aggregate order and delivers to `.fifo` queues.
+- **Redis Streams:** each entry has `id`, `source`, `event_type` and `envelope` (the JSON above), in the stream `outbox:<aggregate_type>`. An aggregate's events stay in order within its stream. Read with `XREADGROUP` and deduplicate on `id`. The relay never trims: use `XTRIM <stream> MINID <id>` once every consumer group has passed an entry (`MAXLEN` drops entries a lagging group has not read).
 - **Rows can be deleted** once they are published, for example with a nightly job that deletes rows older than 7 days, or with daily partitions you drop. The WAL already carried them. If you partition `outbox`, create the publication `WITH (publish = 'insert', publish_via_partition_root = true)`.
 
 ## Examples
@@ -268,7 +268,7 @@ RELAY__SINK__KIND=sqs
 RELAY__SINK__QUEUE_URL=https://sqs.us-east-1.amazonaws.com/123456789012/fulfillment.fifo
 ```
 
-Every event of order 1234 carries `MessageGroupId = order:1234`. SQS FIFO releases the next message of a group only after the previous one is deleted, so `order.cancelled` waits until `order.paid` has been handled. Different orders are still processed in parallel.
+Every event of order 1234 carries `MessageGroupId = app:order:1234` (`app` being its database). SQS FIFO releases the next message of a group only after the previous one is deleted, so `order.cancelled` waits until `order.paid` has been handled. Different orders are still processed in parallel.
 
 **Worker (sketch):** record the event `id` in the same database transaction as the work.
 
@@ -325,7 +325,7 @@ with transaction.atomic():
 RELAY__SINK__QUEUE_URL=https://sqs.us-east-1.amazonaws.com/123456789012/notifications
 ```
 
-Standard queues don't deduplicate, and SQS itself can deliver a message twice. The relay therefore also puts the event `id` and `event_type` in message attributes, so the worker can check them without parsing the body.
+Standard queues don't deduplicate, and SQS itself can deliver a message twice. The relay therefore also puts the event `id`, `event_type` and `source` in message attributes, so the worker can check them without parsing the body.
 
 **Worker (sketch):**
 

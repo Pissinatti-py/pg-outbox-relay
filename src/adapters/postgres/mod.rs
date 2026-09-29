@@ -73,8 +73,14 @@ impl EventSource for PgSource {
         tracing::info!(slot = %self.config.slot, "streaming from the replication slot");
         self.health.source_ready.store(true, Ordering::Relaxed);
 
+        let transactions = Transactions {
+            out,
+            decoder: Decoder::default(),
+            rows: None,
+            source: dsn.dbname.clone(),
+        };
         let result = tokio::select! {
-            result = stream(client, first, out, acked, self.stop) => result,
+            result = stream(client, first, transactions, acked, self.stop) => result,
             () = poll_slot_lag(&dsn, &self.config.slot) => Ok(()),
         };
         self.health.source_ready.store(false, Ordering::Relaxed);
@@ -123,15 +129,10 @@ fn sqlstate(error: &PgWireError) -> Option<&str> {
 async fn stream(
     mut client: ReplicationClient,
     first: ReplicationEvent,
-    out: mpsc::Sender<SourceMsg>,
+    mut transactions: Transactions,
     mut acked: watch::Receiver<Lsn>,
     mut stop: watch::Receiver<bool>,
 ) -> anyhow::Result<()> {
-    let mut transactions = Transactions {
-        out,
-        decoder: Decoder::default(),
-        rows: None,
-    };
     transactions.handle(first).await?;
     loop {
         tokio::select! {
@@ -197,6 +198,8 @@ struct Transactions {
     /// Outbox rows of the transaction being received; `None` between transactions.
     // ponytail: a transaction's rows wait in memory for its Commit; fine for outbox-sized transactions
     rows: Option<Vec<Row>>,
+    /// The database, which every event is tagged with.
+    source: String,
 }
 
 impl Transactions {
@@ -219,8 +222,13 @@ impl Transactions {
                 let lsn = Lsn(end_lsn.0);
                 let committed_at = pg_time(commit_time_micros);
                 for row in self.rows.take().context("commit without a begin")? {
-                    self.send(SourceMsg::Event(outbox_event(row, lsn, committed_at)?))
-                        .await?;
+                    self.send(SourceMsg::Event(outbox_event(
+                        row,
+                        &self.source,
+                        lsn,
+                        committed_at,
+                    )?))
+                    .await?;
                 }
                 self.send(SourceMsg::Progress(lsn)).await?;
             }

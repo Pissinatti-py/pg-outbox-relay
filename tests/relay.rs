@@ -188,6 +188,7 @@ fn events(count: u64, aggregates: u64) -> Vec<OutboxEvent> {
     (1..=count)
         .map(|n| OutboxEvent {
             id: format!("evt-{n}"),
+            source: "acme".into(),
             aggregate_type: "policy".into(),
             aggregate_id: (n % aggregates).to_string(),
             event_type: "policy.updated".into(),

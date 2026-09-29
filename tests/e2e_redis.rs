@@ -67,6 +67,8 @@ async fn relays_outbox_inserts_to_one_stream_per_aggregate_type() -> anyhow::Res
         .iter()
         .map(|entry| {
             let id: String = entry.get("id").expect("has an id");
+            let source: String = entry.get("source").expect("has a source");
+            assert_eq!(source, "postgres");
             let envelope: String = entry.get("envelope").expect("has an envelope");
             let envelope: serde_json::Value = serde_json::from_str(&envelope).unwrap();
             assert_eq!(envelope["id"], id);

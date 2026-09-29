@@ -73,9 +73,10 @@ fn stream(prefix: &str, event: &OutboxEvent) -> String {
 
 /// `envelope` is the JSON the SQS and SNS sinks send as the body; `id` and `event_type`
 /// allow deduplication and filtering without parsing it.
-fn fields(event: &OutboxEvent) -> [(&'static str, String); 3] {
+fn fields(event: &OutboxEvent) -> [(&'static str, String); 4] {
     [
         ("id", event.id.clone()),
+        ("source", event.source.clone()),
         ("event_type", event.event_type.clone()),
         ("envelope", event.envelope()),
     ]
@@ -93,6 +94,7 @@ mod tests {
     fn event(aggregate_id: &str) -> OutboxEvent {
         OutboxEvent {
             id: "7c9e6679-7425-40de-944b-e07fc1f90ae7".into(),
+            source: "acme".into(),
             aggregate_type: "policy".into(),
             aggregate_id: aggregate_id.into(),
             event_type: "policy.approved".into(),
@@ -112,6 +114,7 @@ mod tests {
             fields(&event),
             [
                 ("id", event.id.clone()),
+                ("source", "acme".into()),
                 ("event_type", "policy.approved".into()),
                 ("envelope", event.envelope()),
             ]
