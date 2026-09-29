@@ -184,7 +184,8 @@ pub(super) fn sqs_id(value: &str) -> String {
 
 /// Bytes SQS and SNS count for an entry: the body plus its message attributes, with some slack.
 pub(super) fn size(event: &OutboxEvent, body: &str) -> usize {
-    body.len() + event.id.len() + event.event_type.len() + 64
+    // Values of the id, event_type and source attributes; 64 covers their names and types.
+    body.len() + event.id.len() + event.event_type.len() + event.source.len() + 64
 }
 
 /// Splits entries into calls within `SendMessageBatch` (and `PublishBatch`) limits. An entry too large for
@@ -279,6 +280,30 @@ mod tests {
         assert_eq!(sqs_id("policy:42"), "policy:42");
         assert_eq!(sqs_id("policy:São Paulo"), "policy:S_o_Paulo");
         assert_eq!(sqs_id(&"x".repeat(300)).len(), 128);
+    }
+
+    #[test]
+    fn size_covers_every_byte_sqs_and_sns_count() {
+        let event = OutboxEvent {
+            source: "s".repeat(63), // the longest a database name gets
+            ..event("42")
+        };
+        let body = event.envelope();
+        // They count the body, then each attribute's name, data type and value.
+        let counted = body.len()
+            + [
+                ("id", event.id.as_str()),
+                ("event_type", event.event_type.as_str()),
+                ("source", event.source.as_str()),
+            ]
+            .iter()
+            .map(|(name, value)| name.len() + "String".len() + value.len())
+            .sum::<usize>();
+        let estimated = size(&event, &body);
+        assert!(
+            estimated >= counted,
+            "estimated {estimated} < counted {counted}"
+        );
     }
 
     #[test]
