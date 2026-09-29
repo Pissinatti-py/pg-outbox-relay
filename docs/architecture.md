@@ -50,7 +50,7 @@ The core may use two facades, much like `log`: `tracing` for logs and `metrics` 
 | `src/domain/batch.rs` | `take_batch`: at most one event per aggregate per batch | — |
 | `src/domain/backoff.rs` | Exponential backoff with full jitter (pure: jitter is an argument) | — |
 | `src/ports.rs` | `EventSource`, `EventSink`, `DeadLetterStore`, `PublishError` | domain, tokio channels |
-| `src/app/relay.rs` | `relay::run`: channel → buffer → batch → publish/retry → checkpoint → ack | domain, ports |
+| `src/app/relay.rs` | `relay::run`: channel → buffer → batch → publish/retry/dead-letter → checkpoint → ack | domain, ports |
 | `src/app/mod.rs` | `Health`: readiness flags behind `/readyz` | — |
 | `src/adapters/postgres/mod.rs` | `PgSource`: connect/retry, the replication stream, acks, the slot-lag poller, DSN parsing, SQL connections over the same TLS | pgwire-replication, tokio-postgres |
 | `src/adapters/postgres/pgoutput.rs` | Decodes pgoutput `Relation` and `Insert`; maps a row to an `OutboxEvent` | domain |
@@ -108,7 +108,7 @@ The core may use two facades, much like `log`: `tracing` for logs and `metrics` 
 | Kind | Where | Runs with | Needs |
 |---|---|---|---|
 | Unit: domain rules | `#[cfg(test)]` in `src/domain/*` | `cargo test` | nothing |
-| Unit: adapter logic (pgoutput fixtures captured from Postgres 17, DSN, SQS mapping and splitting, config) | `#[cfg(test)]` in `src/adapters/*`, `src/config.rs` | `cargo test` | nothing |
+| Unit: adapter logic (pgoutput fixtures captured from Postgres 17, DSN, SQS and SNS mapping and splitting, Redis stream mapping and `rediss://` setup, config) | `#[cfg(test)]` in `src/adapters/*`, `src/config.rs` | `cargo test` | nothing |
 | Core behavior through the ports, with fakes and paused time | `tests/relay.rs` | `cargo test` | nothing |
 | Dependency rule | `tests/architecture.rs` | `cargo test` | nothing |
 | End to end: Postgres 17 over TLS → relay → SQS API (ElasticMQ) | `tests/e2e_sqs.rs` | `cargo test -- --ignored` | Docker |
@@ -117,7 +117,7 @@ The core may use two facades, much like `log`: `tracing` for logs and `metrics` 
 | The Postgres adapter against a real database: the dead-letter table and its startup check | `tests/e2e_postgres.rs` | `cargo test -- --ignored` | Docker |
 | The relay binary under signals: SIGTERM drains without replays, a second signal ends a stuck drain, SIGKILL loses nothing | `tests/crash.rs` | `cargo test -- --ignored` | Docker |
 
-The e2e test uses ElasticMQ, a local SQS, because LocalStack now needs an account token. ElasticMQ does not enforce SQS's message-size limit, so the oversized-event path is covered by unit tests only; verify it against real SQS.
+The SQS tests use ElasticMQ, a local SQS, and the SNS test uses moto, because LocalStack now needs an account token. ElasticMQ does not enforce SQS's message-size limit, so the oversized-event path is covered by unit tests only; verify it against real SQS.
 
 ## Adding a sink
 
@@ -139,7 +139,8 @@ Candidates are `pg_logical_emit_message` and a polling fallback for databases wi
 1. Implement `EventSource::run(self, out, acked)`:
    - push `SourceMsg::Event` in commit order, each followed by a `SourceMsg::Progress` for its commit;
    - persist the latest `acked` value wherever the source keeps its position;
-   - after a restart, resume from that position.
+   - after a restart, resume from that position;
+   - to stop cleanly, drop `out` at a transaction boundary and keep reporting `acked` until it closes: its last value is the final ack.
 2. Wire it in `main.rs` behind a new config option.
 
 ## Known limits
@@ -154,4 +155,4 @@ Each is marked in the code with a `ponytail:` comment naming the upgrade path.
 | Channel capacity fixed at 1024 | — | Make it configurable if a benchmark shows it matters |
 | One SQL connection per dead letter | Fine while dead letters are rare | Keep one connection open |
 | Redis: one `XADD` round trip per event | About 10 round trips per batch | Pipeline the batch if the M4 benchmarks ask for it |
-| A drain waits for the broker | An outage holds it until SIGKILL or a second signal (safe: unacked events replay) | — |
+| A drain waits for the broker | An outage holds it until SIGKILL or a second signal (safe: unacked events replay) | A drain-timeout setting, if grace periods prove too short |

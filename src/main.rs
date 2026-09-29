@@ -75,6 +75,7 @@ async fn run() -> anyhow::Result<()> {
             stop.send_replace(true);
             // During a broker outage the drain waits; a second signal, or the orchestrator's
             // SIGKILL, ends it, and unacknowledged events replay on the next start.
+            // ponytail: no drain timeout of our own; add a setting if grace periods prove too short
             tokio::select! {
                 result = &mut relay => result,
                 signal = shutdown_signal() => {

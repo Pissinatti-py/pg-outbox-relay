@@ -2,13 +2,13 @@
 
 **Reliable event publishing from PostgreSQL to message brokers, without dual writes.**
 
-`pg-outbox-relay` is one small Rust binary. It streams the rows your application inserts into an `outbox` table, using Postgres logical replication, and publishes them to Amazon SQS.
+`pg-outbox-relay` is one small Rust binary. It streams the rows your application inserts into an `outbox` table, using Postgres logical replication, and publishes them to Amazon SQS, Amazon SNS or Redis Streams.
 
 - **At-least-once:** every committed event is published, even across relay crashes, restarts and broker outages.
 - **Ordered per aggregate:** events of the same `aggregate_type` + `aggregate_id` arrive in commit order.
 - **Idempotent consumers made easy:** every event carries a stable `id` to deduplicate on.
 
-> **Status: milestone 1.** SQS (FIFO and standard) is supported. SNS, Redis Streams and a dead-letter table come next; see the [Roadmap](#roadmap).
+> **Status: milestone 2.** SQS and SNS (FIFO and standard) and Redis Streams, with a dead-letter table, graceful drain on SIGTERM and TLS on every Postgres connection. Multi-database relaying comes next; see the [Roadmap](#roadmap).
 
 ---
 
@@ -41,7 +41,7 @@ Those two writes cannot be atomic. Publishing after the commit can lose the even
 
 The **transactional outbox** pattern closes it. The application writes the event into an `outbox` table **in the same transaction** as the business change, so the event exists exactly when the change does. A separate relay then publishes committed outbox rows.
 
-Debezium with Kafka Connect does this too, but it brings a JVM, Kafka and connectors. `pg-outbox-relay` is for teams that already run Postgres and SQS: **one binary (about 15 MB), one config, Prometheus metrics.**
+Debezium with Kafka Connect does this too, but it brings a JVM, Kafka and connectors. `pg-outbox-relay` is for teams that already run Postgres and SQS, SNS or Redis: **one binary (about 15 MB), one config, Prometheus metrics.**
 
 ## How it works
 
@@ -59,19 +59,19 @@ Debezium with Kafka Connect does this too, but it brings a JVM, Kafka and connec
  └──────────────────────────────┬─────────────────────────────────────┘
                                 │ logical replication stream
  ┌──────────────────────────────▼────── pg-outbox-relay ──────────────┐
- │  Postgres source ──► bounded channel ──► batch ──► SQS sink        │
+ │  Postgres source ──► bounded channel ──► batch ──► sink            │
  │        ▲                                              │            │
- │        └──── ack LSN (only after SQS confirmed) ◄─────┘            │
+ │        └──── ack LSN (after the broker confirmed) ◄───┘            │
  └──────────────────────────────┬─────────────────────────────────────┘
                                 ▼
-                        SQS (FIFO or standard)
+             SQS (FIFO or standard) · SNS (FIFO or standard) · Redis Streams
 ```
 
 1. **Stream.** The relay holds a replication slot. Postgres sends every committed outbox insert, in commit order, milliseconds after the commit. There is no polling.
-2. **Buffer.** Events pass through a bounded channel. If SQS is slow, the relay stops reading, and Postgres keeps the WAL instead of the relay filling its memory.
-3. **Batch.** Up to 10 events per `SendMessageBatch`, flushed on size or after 20 ms. A batch never holds two events of the same aggregate, so a partial failure cannot reorder them.
+2. **Buffer.** Events pass through a bounded channel. If the broker is slow, the relay stops reading, and Postgres keeps the WAL instead of the relay filling its memory.
+3. **Batch.** Up to 10 events per call (`SendMessageBatch` or `PublishBatch`), flushed on size or after 20 ms. A batch never holds two events of the same aggregate, so a partial failure cannot reorder them.
 4. **Publish.** Failed events are retried with exponential backoff and jitter, before anything newer goes out.
-5. **Acknowledge.** The relay tells Postgres it has consumed up to LSN *X* **only after SQS confirmed every event up to *X***. After a crash, Postgres replays from the last acknowledged position. That is the whole at-least-once mechanism: no extra state store.
+5. **Acknowledge.** The relay tells Postgres it has consumed up to LSN *X* **only after the broker confirmed every event up to *X***. After a crash, Postgres replays from the last acknowledged position. That is the whole at-least-once mechanism: no extra state store.
 
 The code is split into hexagonal layers: pure rules, then ports, then the pipeline, then adapters. [docs/architecture.md](docs/architecture.md) walks through it.
 
@@ -233,7 +233,7 @@ Each SQS message body is the envelope shown in the [Quickstart](#quickstart-5-mi
 
 ## Examples
 
-Three common ways to use the relay as it is today: Postgres → SQS.
+Three common ways to use the relay with SQS. SNS and Redis Streams work the same way: pick the sink in [Configure](#configure).
 
 | Example | Queue | Why that queue | The idea to take away |
 |---|---|---|---|
@@ -485,7 +485,7 @@ To republish one after fixing the cause, insert a corrected row into `outbox` wi
 | Situation | What happens |
 |---|---|
 | The relay crashes after publishing, before acknowledging | On restart Postgres replays from the last ack: duplicates with the **same `id`**. FIFO queues drop them within 5 minutes |
-| SQS is down, throttling, or credentials are wrong | Retried forever with backoff. The slot keeps the WAL, `/readyz` turns 503, `OutboxPublishStalled` fires. Nothing is lost |
+| The broker is down, throttling, or credentials are wrong | Retried forever with backoff. The slot keeps the WAL, `/readyz` turns 503, `OutboxPublishStalled` fires. Nothing is lost |
 | The database restarts or the connection drops | The relay exits (crash-only design), the orchestrator restarts it, it waits for the database and resumes from the last ack |
 | A transaction rolls back | It never reaches the WAL stream, so it is never published |
 | The broker (SQS or SNS) rejects an event for good (invalid content, too large) | Stored in `outbox_dead_letter` with the broker's reason (retried until it is), logged at `ERROR`, counted in `pg_outbox_dead_letters_total`, then skipped so one bad row cannot block the stream. Redis never rejects content, so the Redis sink never dead-letters |
@@ -501,7 +501,7 @@ Prerequisites: Rust 1.94.1 or newer (the AWS SDK sets that minimum) and Docker f
 cargo test                          # unit, core and architecture tests: fast, no Docker
 cargo test -- --ignored             # end to end (SQS, SNS, Redis, dead letters) and the crash tests: the relay binary under SIGTERM and SIGKILL
 cargo fmt --check && cargo clippy --all-targets -- -D warnings
-cargo run -- relay.toml             # against your own Postgres and SQS
+cargo run -- relay.toml             # against your own Postgres and broker
 ```
 
 The code follows a hexagonal architecture: dependencies point inward, and `tests/architecture.rs` enforces that.
@@ -533,8 +533,8 @@ Decisions are recorded in [docs/adr/](docs/adr/), for example why the replicatio
 | Milestone | Scope | Status |
 |---|---|---|
 | **M1** | Replication source, SQS FIFO sink, LSN checkpointing, metrics and health, Docker Compose demo, end-to-end test | ✅ done |
-| **M2** | SNS and Redis Streams sinks, `outbox_dead_letter` table, graceful drain on SIGTERM, TLS for SQL connections, process-kill crash test in CI | next |
-| **M3** | Multi-source: one process relays N databases (one slot per tenant database). Until then, run one relay per database | planned |
+| **M2** | SNS and Redis Streams sinks, `outbox_dead_letter` table, graceful drain on SIGTERM, TLS for SQL connections, process-kill crash test in CI | ✅ done |
+| **M3** | Multi-source: one process relays N databases (one slot per tenant database). Until then, run one relay per database | next |
 | **M4** | Benchmarks (events/s, p99 latency, memory) against a Python polling relay | planned |
 
 Non-goals: exactly-once end to end, general-purpose CDC for arbitrary tables (use Debezium), and schema registries or routing DSLs.
