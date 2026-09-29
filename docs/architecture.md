@@ -51,7 +51,7 @@ The core may use two facades, much like `log`: `tracing` for logs and `metrics` 
 | `src/ports.rs` | `EventSource`, `EventSink`, `PublishError` | domain, tokio channels |
 | `src/app/relay.rs` | `relay::run`: channel → buffer → batch → publish/retry → checkpoint → ack | domain, ports |
 | `src/app/mod.rs` | `Health`: readiness flags behind `/readyz` | — |
-| `src/adapters/postgres/mod.rs` | `PgSource`: connect/retry, the replication stream, acks, the slot-lag poller, DSN parsing | pgwire-replication, tokio-postgres |
+| `src/adapters/postgres/mod.rs` | `PgSource`: connect/retry, the replication stream, acks, the slot-lag poller, DSN parsing, SQL connections over the same TLS | pgwire-replication, tokio-postgres |
 | `src/adapters/postgres/pgoutput.rs` | Decodes pgoutput `Relation` and `Insert`; maps a row to an `OutboxEvent` | domain |
 | `src/adapters/sqs.rs` | `SqsSink`: envelope → `SendMessageBatch`, call splitting, error classification | aws-sdk-sqs |
 | `src/adapters/http.rs` | `/metrics`, `/healthz`, `/readyz` | axum, metrics-exporter-prometheus |
@@ -143,5 +143,4 @@ Each is marked in the code with a `ponytail:` comment naming the upgrade path.
 | A transaction's rows wait for its `Commit` in memory | Very large outbox transactions use memory | Stream in-progress transactions (pgoutput protocol v2) |
 | Channel capacity fixed at 1024 | — | Make it configurable if a benchmark shows it matters |
 | Poison events only logged (M1) | The envelope lives only in logs | M2: `outbox_dead_letter` table |
-| Slot lag needs `sslmode=disable` (M1) | No lag metric with TLS to Postgres | M2: TLS for SQL connections |
 | Stops immediately on SIGTERM (M1) | Duplicates after deploys | M2: drain in-flight batches, send a final ack |

@@ -407,7 +407,7 @@ The relay reads a TOML file (first argument, default `./relay.toml`), then envir
 
 | Setting | Environment variable | Default | Meaning |
 |---|---|---|---|
-| `source.dsn` | `RELAY__SOURCE__DSN` | required | `postgres://user:password@host:5432/db?sslmode=verify-full&sslrootcert=/ca.pem`. `sslmode`: `disable`, `prefer` (default), `require`, `verify-ca`, `verify-full` |
+| `source.dsn` | `RELAY__SOURCE__DSN` | required | `postgres://user:password@host:5432/db?sslmode=verify-full&sslrootcert=/ca.pem`. `sslmode`: `disable`, `prefer` (default), `require`, `verify-ca`, `verify-full`. It applies to every connection: replication and slot lag |
 | `source.slot` | `RELAY__SOURCE__SLOT` | required | Replication slot, for example `outbox_relay` |
 | `source.publication` | `RELAY__SOURCE__PUBLICATION` | required | Publication, for example `outbox_pub` |
 | `sink.kind` | `RELAY__SINK__KIND` | required | `sqs` |
@@ -443,7 +443,7 @@ The relay reads a TOML file (first argument, default `./relay.toml`), then envir
 | `pg_outbox_events_published_total{sink}` | counter | Throughput |
 | `pg_outbox_publish_errors_total{sink,kind}` | counter | Broker health. `kind` is `retryable` or `permanent` |
 | `pg_outbox_publish_latency_seconds` | histogram | Commit → broker acknowledgement |
-| `pg_outbox_slot_lag_bytes` | gauge | **The main alert signal:** WAL the slot holds back. M1 exports it only with `sslmode=disable`; watch `pg_replication_slots` otherwise |
+| `pg_outbox_slot_lag_bytes` | gauge | **The main alert signal:** WAL the slot holds back |
 | `pg_outbox_dead_letters_total` | counter | Events skipped as permanently rejected |
 | `pg_outbox_channel_depth` | gauge | Backpressure: near 1024 means the broker is the bottleneck |
 

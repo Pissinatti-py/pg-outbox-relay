@@ -55,5 +55,5 @@ Use `pgwire-replication` for the replication connection.
   - fail fast on anything else;
   - `42704` gets a hint pointing to `sql/slot.sql`.
 - **DSN parsing uses the `url` crate** (already in the tree through `aws-config`), because `tokio-postgres`'s parser rejects `sslmode=verify-ca` and `sslmode=verify-full`.
-- **SQL connections still use `tokio-postgres`.** That means the slot-lag poller now and the dead-letter table in M2. TLS for SQL connections arrives with M2. Until then the poller runs only with `sslmode=disable` and otherwise stays off, with a warning, so credentials are never sent in clear.
+- **SQL connections still use `tokio-postgres`.** That means the slot-lag poller now and the dead-letter table in M2. TLS for SQL connections arrives with M2. Until then the poller runs only with `sslmode=disable` and otherwise stays off, with a warning, so credentials are never sent in clear. (M2: SQL connections negotiate TLS through pgwire-replication; see `sql_connect`.)
 - **Single-maintainer risk** is contained by the `EventSource` port: only `src/adapters/postgres/` knows this crate, and the decoder is ours.

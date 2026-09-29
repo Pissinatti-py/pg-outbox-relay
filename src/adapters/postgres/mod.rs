@@ -11,8 +11,10 @@ use std::time::Duration;
 use anyhow::{Context, anyhow, bail, ensure};
 use percent_encoding::percent_decode_str;
 use pgwire_replication::client::ReplicationEvent;
+use pgwire_replication::tls::rustls::maybe_upgrade_to_tls;
 use pgwire_replication::{PgWireError, ReplicationClient, ReplicationConfig, SslMode, TlsConfig};
 use serde::Deserialize;
+use tokio::net::TcpStream;
 use tokio::sync::{mpsc, watch};
 
 use crate::app::Health;
@@ -183,34 +185,20 @@ impl Transactions {
 }
 
 /// Exports how much WAL the slot holds back, i.e. what a stuck relay costs the database.
-// ponytail: plain-text SQL connection only; TLS for SQL connections lands with M2's dead-letter table
 async fn poll_slot_lag(dsn: &Dsn, slot: &str) {
-    if dsn.sslmode != SslMode::Disable {
-        tracing::warn!(
-            "pg_outbox_slot_lag_bytes needs sslmode=disable until SQL connections get TLS (M2); \
-             watch pg_replication_slots from your database monitoring meanwhile"
-        );
-        return std::future::pending().await;
-    }
-    let mut config = tokio_postgres::Config::new();
-    config
-        .host(&dsn.host)
-        .port(dsn.port)
-        .user(&dsn.user)
-        .password(&dsn.password)
-        .dbname(&dsn.dbname);
     loop {
-        match slot_lag(&config, slot).await {
+        match slot_lag(dsn, slot).await {
             Ok(bytes) => metrics::gauge!("pg_outbox_slot_lag_bytes").set(bytes as f64),
-            Err(error) => tracing::warn!(%error, "could not read the slot lag"),
+            Err(error) => {
+                tracing::warn!(error = format!("{error:#}"), "could not read the slot lag")
+            }
         }
         tokio::time::sleep(SLOT_LAG_INTERVAL).await;
     }
 }
 
-async fn slot_lag(config: &tokio_postgres::Config, slot: &str) -> anyhow::Result<i64> {
-    let (client, connection) = config.connect(tokio_postgres::NoTls).await?;
-    tokio::spawn(connection);
+async fn slot_lag(dsn: &Dsn, slot: &str) -> anyhow::Result<i64> {
+    let client = sql_connect(dsn).await?;
     let row = client
         .query_opt(
             "SELECT pg_wal_lsn_diff(pg_current_wal_lsn(), confirmed_flush_lsn)::bigint \
@@ -220,6 +208,23 @@ async fn slot_lag(config: &tokio_postgres::Config, slot: &str) -> anyhow::Result
         .await?
         .with_context(|| format!("replication slot {slot} does not exist"))?;
     Ok(row.get(0))
+}
+
+/// A SQL connection with the replication connection's TLS behavior, for every sslmode:
+/// pgwire-replication negotiates TLS, then tokio-postgres talks over that stream.
+// ponytail: couples SQL TLS to pgwire-replication; switch to tokio-postgres-rustls if it is ever replaced
+async fn sql_connect(dsn: &Dsn) -> anyhow::Result<tokio_postgres::Client> {
+    let tcp = TcpStream::connect((dsn.host.as_str(), dsn.port)).await?;
+    let stream = maybe_upgrade_to_tls(tcp, &dsn.tls(), &dsn.host).await?;
+    let (client, connection) = tokio_postgres::Config::new()
+        .user(&dsn.user)
+        .password(&dsn.password)
+        .dbname(&dsn.dbname)
+        .ssl_mode(tokio_postgres::config::SslMode::Disable) // already negotiated above
+        .connect_raw(stream, tokio_postgres::NoTls)
+        .await?;
+    tokio::spawn(connection);
+    Ok(client)
 }
 
 /// Connection settings from a libpq-style URL.
@@ -276,12 +281,15 @@ impl Dsn {
         Ok(parsed)
     }
 
-    fn replication(&self, config: &PgConfig) -> ReplicationConfig {
-        let tls = TlsConfig {
+    fn tls(&self) -> TlsConfig {
+        TlsConfig {
             mode: self.sslmode,
             ca_pem_path: self.sslrootcert.clone(),
             ..TlsConfig::default()
-        };
+        }
+    }
+
+    fn replication(&self, config: &PgConfig) -> ReplicationConfig {
         ReplicationConfig::new(
             self.host.as_str(),
             self.user.as_str(),
@@ -291,7 +299,7 @@ impl Dsn {
             config.publication.as_str(),
         )
         .with_port(self.port)
-        .with_tls(tls)
+        .with_tls(self.tls())
         // pgoutput sends values as text; pin their format so `created_at` parses the same everywhere.
         .with_options("-c TimeZone=UTC -c DateStyle=ISO")
         .with_status_interval(FEEDBACK_INTERVAL)
