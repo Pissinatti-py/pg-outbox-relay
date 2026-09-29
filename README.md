@@ -8,7 +8,7 @@
 - **Ordered per aggregate:** events of the same `aggregate_type` + `aggregate_id` arrive in commit order.
 - **Idempotent consumers made easy:** every event carries a stable `id` to deduplicate on.
 
-> **Status: milestone 2.** SQS and SNS (FIFO and standard) and Redis Streams, with a dead-letter table, graceful drain on SIGTERM and TLS on every Postgres connection. Multi-database relaying comes next; see the [Roadmap](#roadmap).
+> **Status: milestone 3.** One relay serves many tenant databases (one slot each), publishing to SQS, SNS or Redis Streams. Benchmarks come next; see the [Roadmap](#roadmap).
 
 ---
 
@@ -22,8 +22,9 @@
 6. [Configure](#configure)
 7. [Operate](#operate)
 8. [Delivery semantics](#delivery-semantics)
-9. [Develop](#develop)
-10. [Roadmap](#roadmap)
+9. [Upgrading from M2](#upgrading-from-m2)
+10. [Develop](#develop)
+11. [Roadmap](#roadmap)
 
 ---
 
@@ -520,6 +521,14 @@ To republish one after fixing the cause, insert a corrected row into `outbox` wi
 
 Exactly-once is not a goal. It is the consumer's job, made possible by `id`.
 
+## Upgrading from M2
+
+A single-database config needs no changes. What consumers and operators see:
+- **Events gain `source`**, the database they were committed in: a field in the envelope, a `source` message attribute on SQS and SNS, a `source` field on Redis Streams.
+- **FIFO `MessageGroupId` gains a `<database>:` prefix.** An aggregate's last event before the upgrade and its first event after it land in different groups, so drain the queue before upgrading if that ordering matters.
+- **Every metric gains a `source` label.** The shipped alerts and dashboard are updated, and there is a new `pg_outbox_source_up` gauge and `OutboxSourceDown` alert.
+- **A source error no longer exits the process.** A database that is down or a missing slot restarts that source's pipeline after a backoff, and `pg_outbox_source_up` shows it.
+
 ## Develop
 
 Prerequisites: Rust 1.94.1 or newer (the AWS SDK sets that minimum) and Docker for the end-to-end test.
@@ -561,8 +570,8 @@ Decisions are recorded in [docs/adr/](docs/adr/), for example why the replicatio
 |---|---|---|
 | **M1** | Replication source, SQS FIFO sink, LSN checkpointing, metrics and health, Docker Compose demo, end-to-end test | ✅ done |
 | **M2** | SNS and Redis Streams sinks, `outbox_dead_letter` table, graceful drain on SIGTERM, TLS for SQL connections, process-kill crash test in CI | ✅ done |
-| **M3** | Multi-source: one process relays N databases (one slot per tenant database). Until then, run one relay per database | next |
-| **M4** | Benchmarks (events/s, p99 latency, memory) against a Python polling relay | planned |
+| **M3** | Multi-source: one process relays N databases (one slot per tenant database) | ✅ done |
+| **M4** | Benchmarks (events/s, p99 latency, memory) against a Python polling relay | next |
 
 Non-goals: exactly-once end to end, general-purpose CDC for arbitrary tables (use Debezium), and schema registries or routing DSLs.
 

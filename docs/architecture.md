@@ -19,6 +19,7 @@ For what the relay is and how to run it, see the [README](../README.md). The ori
             │             DeadLetterStore                     │
             ├─────────────────────────────────────────────────┤
             │  app/       relay::run: the pipeline use case   │
+            │             relay::supervise: one per source    │
             ├─────────────────────────────────────────────────┤
             │  domain/    events, envelope, checkpoint,       │
             │             batching rule, backoff (pure)       │
@@ -51,16 +52,16 @@ The core may use two facades, much like `log`: `tracing` for logs and `metrics` 
 | `src/domain/backoff.rs` | Exponential backoff with full jitter (pure: jitter is an argument) | — |
 | `src/ports.rs` | `EventSource`, `EventSink`, `DeadLetterStore`, `PublishError` | domain, tokio channels |
 | `src/app/relay.rs` | `relay::run`: channel → buffer → batch → publish/retry/dead-letter → checkpoint → ack; `relay::supervise`: restarts a failed source's pipeline | domain, ports |
-| `src/app/mod.rs` | `Health`: readiness flags behind `/readyz` | — |
+| `src/app/mod.rs` | `Health`: readiness flags behind `/readyz`; `stopped`: resolves when the relay is asked to stop | — |
 | `src/adapters/postgres/mod.rs` | `PgSource`: connect/retry, the replication stream, acks, the slot-lag poller, DSN parsing, SQL connections over the same TLS | pgwire-replication, tokio-postgres |
 | `src/adapters/postgres/pgoutput.rs` | Decodes pgoutput `Relation` and `Insert`; maps a row to an `OutboxEvent` | domain |
 | `src/adapters/postgres/dead_letter.rs` | `PgDeadLetters`: stores rejected events in `outbox_dead_letter`; the startup check | tokio-postgres |
 | `src/adapters/sqs.rs` | `SqsSink`: envelope → `SendMessageBatch`, call splitting, error classification (shared with SNS) | aws-sdk-sqs |
 | `src/adapters/sns.rs` | `SnsSink`: envelope → `PublishBatch`, reusing the SQS splitting, id mapping and classification | aws-sdk-sns |
-| `src/adapters/redis.rs` | `RedisSink`: `XADD` of `id`, `event_type`, `envelope` to one stream per aggregate type | redis |
+| `src/adapters/redis.rs` | `RedisSink`: `XADD` of `id`, `source`, `event_type`, `envelope` to one stream per aggregate type | redis |
 | `src/adapters/http.rs` | `/metrics`, `/healthz`, `/readyz` | axum, metrics-exporter-prometheus |
 | `src/config.rs` | TOML file + `RELAY__…` env overrides → each layer's own settings struct | config |
-| `src/main.rs` | Wires everything together; logging; signals | everything |
+| `src/main.rs` | Wires everything together: one supervised pipeline per source (`relay_all`); logging; signals | everything |
 
 ## The life of one event
 
@@ -102,7 +103,7 @@ The core may use two facades, much like `log`: `tracing` for logs and `metrics` 
 - **A missing slot fails that source**, with a hint to run `sql/slot.sql`, and it is retried with the backoff. The relay never creates slots: a recreated slot silently skips everything committed before it existed.
 - **A missing dead-letter table or grant fails that source** as it starts, once the database is reachable, instead of stalling at the first rejected event, and it is retried with the backoff.
 - **Broker errors never crash.** They are retried forever with backoff (100 ms up to 30 s), during which `sink_ready` is false.
-- **Shutdown drains.** On SIGTERM/SIGINT the source stops reading the WAL at a transaction boundary, the core publishes everything already read, the final ack reaches Postgres, and the process exits 0: the next start replays nothing. A standby waiting for the slot exits at once. During a broker outage the drain waits; a second signal (or the orchestrator's SIGKILL) ends it, and unacknowledged events replay.
+- **Shutdown drains.** On SIGTERM/SIGINT every source stops reading its WAL at a transaction boundary, its core publishes everything already read, its final ack reaches Postgres, and the process exits 0: the next start replays nothing. A source waiting for its slot, or in a restart backoff, stops at once. During a broker outage the drain waits; a second signal (or the orchestrator's SIGKILL) ends it, and unacknowledged events replay.
 
 ## Tests
 
