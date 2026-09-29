@@ -12,7 +12,7 @@ use tokio::time::{Instant, sleep, sleep_until};
 
 use super::Health;
 use crate::domain::{Checkpoint, Lsn, OutboxEvent, SourceMsg, backoff, take_batch};
-use crate::ports::{EventSink, EventSource, PublishError};
+use crate::ports::{DeadLetterStore, EventSink, EventSource, PublishError};
 
 /// How far the source may run ahead of the sink before it has to wait.
 // ponytail: fixed; make it configurable if a benchmark says it matters
@@ -55,10 +55,12 @@ impl Default for Retry {
 /// Relays events from `source` to `sink` until the source stops.
 ///
 /// A source error is returned right away: nothing unpublished was acked, so a
-/// restart replays it. A clean stop first publishes everything the source sent.
-pub async fn run<K: EventSink>(
+/// restart replays it. A clean stop first publishes everything the source sent,
+/// then waits for the source to report the final ack.
+pub async fn run<K: EventSink, D: DeadLetterStore>(
     source: impl EventSource,
     sink: K,
+    dead_letters: D,
     batching: Batching,
     retry: Retry,
     health: Arc<Health>,
@@ -82,26 +84,30 @@ pub async fn run<K: EventSink>(
 
     let core = Core {
         sink,
+        dead_letters,
         batching,
         retry,
         health,
         ack,
         checkpoint: Checkpoint::default(),
     };
+    let source = source.run(tx, acked);
     let core = core.run(rx);
-    tokio::pin!(core);
+    tokio::pin!(source, core);
     tokio::select! {
-        result = source.run(tx, acked) => {
+        result = &mut source => {
             result?;
             core.await;
             Ok(())
         }
-        () = &mut core => Ok(()),
+        // The source stopped sending and the core published the rest: now the source sends the final ack.
+        () = &mut core => source.await,
     }
 }
 
-struct Core<K> {
+struct Core<K, D> {
     sink: K,
+    dead_letters: D,
     batching: Batching,
     retry: Retry,
     health: Arc<Health>,
@@ -109,7 +115,7 @@ struct Core<K> {
     checkpoint: Checkpoint,
 }
 
-impl<K: EventSink> Core<K> {
+impl<K: EventSink, D: DeadLetterStore> Core<K, D> {
     async fn run(mut self, mut rx: mpsc::Receiver<SourceMsg>) {
         let max_wait = Duration::from_millis(self.batching.max_wait_ms);
         let mut buffer = VecDeque::new();
@@ -181,17 +187,17 @@ impl<K: EventSink> Core<K> {
                         self.checkpoint.confirm(event.commit_lsn);
                     }
                     Err(PublishError::Permanent(reason)) => {
-                        // ponytail: M1 keeps a poison event only in this log line; M2 adds outbox_dead_letter
                         tracing::error!(
                             event_id = %event.id,
                             lsn = %event.commit_lsn,
                             %reason,
                             envelope = %event.envelope(),
-                            "event rejected permanently, skipping it"
+                            "event rejected permanently, moving it to the dead-letter table"
                         );
                         metrics::counter!("pg_outbox_publish_errors_total", "sink" => K::NAME, "kind" => "permanent")
                             .increment(1);
                         metrics::counter!("pg_outbox_dead_letters_total").increment(1);
+                        self.dead_letter(&event, &reason).await;
                         self.checkpoint.confirm(event.commit_lsn);
                     }
                     Err(PublishError::Retryable(reason)) => {
@@ -221,6 +227,27 @@ impl<K: EventSink> Core<K> {
             pending = failed;
         }
         self.health.sink_ready.store(true, Ordering::Relaxed);
+    }
+
+    /// Stores a rejected event before it is confirmed, so the ack never passes an event that
+    /// is neither published nor dead-lettered. Retried forever, like publishing.
+    async fn dead_letter(&self, event: &OutboxEvent, reason: &str) {
+        let initial = Duration::from_millis(self.retry.initial_backoff_ms);
+        let max = Duration::from_millis(self.retry.max_backoff_ms);
+        let mut attempt = 0;
+        while let Err(error) = self.dead_letters.store(event, reason).await {
+            self.health.sink_ready.store(false, Ordering::Relaxed);
+            let delay = backoff(attempt, initial, max, fastrand::f64());
+            tracing::warn!(
+                event_id = %event.id,
+                attempt,
+                retry_in_ms = delay.as_millis() as u64,
+                error = format!("{error:#}"),
+                "cannot store the dead letter, retrying"
+            );
+            sleep(delay).await;
+            attempt = attempt.saturating_add(1);
+        }
     }
 
     fn send_ack(&mut self) {

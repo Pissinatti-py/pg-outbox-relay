@@ -4,11 +4,14 @@ use std::process::ExitCode;
 use std::sync::Arc;
 
 use pg_outbox_relay::adapters::http;
-use pg_outbox_relay::adapters::postgres::PgSource;
+use pg_outbox_relay::adapters::postgres::{PgDeadLetters, PgSource};
+use pg_outbox_relay::adapters::redis::RedisSink;
+use pg_outbox_relay::adapters::sns::SnsSink;
 use pg_outbox_relay::adapters::sqs::SqsSink;
 use pg_outbox_relay::app::{Health, relay};
 use pg_outbox_relay::config::{Config, SinkConfig};
 use tokio::signal::unix::{SignalKind, signal};
+use tokio::sync::watch;
 use tracing_subscriber::EnvFilter;
 
 #[tokio::main]
@@ -38,28 +41,52 @@ async fn run() -> anyhow::Result<()> {
     let config = Config::load(&path)?;
     let metrics = http::install_metrics()?;
     let health = Arc::new(Health::default());
+    let (stop, stopped) = watch::channel(false);
 
-    let source = PgSource::new(config.source, health.clone());
+    let dead_letters = PgDeadLetters::new(&config.source)?;
+    let source = PgSource::new(config.source, health.clone(), stopped);
     let relay = async {
-        let sink = match config.sink {
-            SinkConfig::Sqs(sqs) => SqsSink::connect(sqs).await?,
-        };
-        relay::run(source, sink, config.batching, config.retry, health.clone()).await
+        // One arm per sink: relay::run is compiled for each concrete sink, with no trait objects.
+        let (batching, retry, health) = (config.batching, config.retry, health.clone());
+        match config.sink {
+            SinkConfig::Sqs(sqs) => {
+                let sink = SqsSink::connect(sqs).await?;
+                relay::run(source, sink, dead_letters, batching, retry, health).await
+            }
+            SinkConfig::Sns(sns) => {
+                let sink = SnsSink::connect(sns).await?;
+                relay::run(source, sink, dead_letters, batching, retry, health).await
+            }
+            SinkConfig::Redis(redis) => {
+                let sink = RedisSink::connect(redis).await?;
+                relay::run(source, sink, dead_letters, batching, retry, health).await
+            }
+        }
     };
+    tokio::pin!(relay);
 
     // Whichever finishes first ends the process. Crashing is safe: Postgres replays
     // everything unacknowledged on the next start.
     tokio::select! {
-        result = relay => result,
+        result = &mut relay => result,
         result = http::serve(config.server.listen, metrics, health.clone()) => result,
         signal = shutdown_signal() => {
-            tracing::info!("{} received, stopping; unacknowledged events replay on the next start", signal?);
-            Ok(())
+            tracing::info!("{} received, draining: publishing what was read, then sending a final ack", signal?);
+            stop.send_replace(true);
+            // During a broker outage the drain waits; a second signal, or the orchestrator's
+            // SIGKILL, ends it, and unacknowledged events replay on the next start.
+            // ponytail: no drain timeout of our own; add a setting if grace periods prove too short
+            tokio::select! {
+                result = &mut relay => result,
+                signal = shutdown_signal() => {
+                    tracing::warn!("{} received again, stopping without a final ack", signal?);
+                    Ok(())
+                }
+            }
         }
     }
 }
 
-// ponytail: stops right away; M2 drains in-flight batches and sends a final ack first
 async fn shutdown_signal() -> anyhow::Result<&'static str> {
     let mut terminate = signal(SignalKind::terminate())?;
     tokio::select! {

@@ -39,4 +39,4 @@ groups:
           severity: ticket
         annotations:
           summary: "Events were rejected permanently and skipped"
-          description: "Their full envelopes are in the relay's ERROR logs (message: event rejected permanently)."
+          description: "Their envelopes and the broker's reasons are in the outbox_dead_letter table."

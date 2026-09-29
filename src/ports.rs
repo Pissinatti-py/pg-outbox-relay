@@ -11,6 +11,10 @@ pub trait EventSource: Send + 'static {
     /// Pushes messages into `out` in commit order, and reports the latest value of
     /// `acked` back to the database as its confirmed position.
     ///
+    /// To stop cleanly, a source drops `out` at a transaction boundary, then keeps reporting
+    /// `acked` until the core drops it: the core has then published everything it was sent,
+    /// and the last value is the final ack.
+    ///
     /// Contract: when started again after a crash, the source resumes from the last
     /// position it reported, so every unacknowledged event is delivered again.
     fn run(
@@ -37,7 +41,18 @@ pub enum PublishError {
     /// May succeed later: throttling, network, broker down, bad credentials. Retried forever;
     /// the replication slot keeps the WAL meanwhile.
     Retryable(String),
-    /// Will never succeed, e.g. the broker rejected the message itself. Skipped so one
-    /// bad row cannot block the stream.
+    /// Will never succeed, e.g. the broker rejected the message itself. Stored in the
+    /// dead-letter table, then skipped, so one bad row cannot block the stream.
     Permanent(String),
+}
+
+/// Where permanently rejected events are kept: the `outbox_dead_letter` table in production.
+pub trait DeadLetterStore: Send + Sync + 'static {
+    /// Stores `event` with the broker's `reason`. Storing the same event again must be a
+    /// no-op: after a crash, a replayed event can be rejected and stored twice.
+    fn store(
+        &self,
+        event: &OutboxEvent,
+        reason: &str,
+    ) -> impl Future<Output = anyhow::Result<()>> + Send;
 }

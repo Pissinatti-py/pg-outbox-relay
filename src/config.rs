@@ -8,6 +8,8 @@ use config::{Environment, File, FileFormat};
 use serde::Deserialize;
 
 use crate::adapters::postgres::PgConfig;
+use crate::adapters::redis::RedisConfig;
+use crate::adapters::sns::SnsConfig;
 use crate::adapters::sqs::SqsConfig;
 use crate::app::relay::{Batching, Retry};
 
@@ -27,6 +29,8 @@ pub struct Config {
 #[serde(tag = "kind", rename_all = "lowercase")]
 pub enum SinkConfig {
     Sqs(SqsConfig),
+    Sns(SnsConfig),
+    Redis(RedisConfig),
 }
 
 #[derive(Debug, Deserialize)]
@@ -83,7 +87,9 @@ mod tests {
         assert_eq!(config.source.slot, "outbox_relay");
         assert_eq!(config.batching.max_events, 10);
         assert_eq!(config.server.listen, "0.0.0.0:9090".parse().unwrap());
-        let SinkConfig::Sqs(sqs) = config.sink;
+        let SinkConfig::Sqs(sqs) = config.sink else {
+            panic!("expected the sqs sink");
+        };
         assert!(sqs.queue_url.ends_with("events.fifo"));
     }
 
@@ -101,7 +107,9 @@ mod tests {
         )
         .unwrap();
         assert_eq!(config.batching.max_events, 5);
-        let SinkConfig::Sqs(sqs) = config.sink;
+        let SinkConfig::Sqs(sqs) = config.sink else {
+            panic!("expected the sqs sink");
+        };
         assert_eq!(
             sqs.queue_url,
             "http://localstack:4566/000000000000/other.fifo"
@@ -125,6 +133,38 @@ mod tests {
         )
         .unwrap();
         assert_eq!(config.retry.max_backoff_ms, 30_000);
+    }
+
+    #[test]
+    fn selects_the_sink_by_kind() {
+        let source = [
+            ("RELAY__SOURCE__DSN", "postgres://relay:relay@db/app"),
+            ("RELAY__SOURCE__SLOT", "outbox_relay"),
+            ("RELAY__SOURCE__PUBLICATION", "outbox_pub"),
+        ];
+        let sink = |vars: &[(&str, &str)]| {
+            Config::from("does-not-exist.toml", env(&[&source[..], vars].concat()))
+                .unwrap()
+                .sink
+        };
+        let SinkConfig::Sns(sns) = sink(&[
+            ("RELAY__SINK__KIND", "sns"),
+            (
+                "RELAY__SINK__TOPIC_ARN",
+                "arn:aws:sns:us-east-1:1:events.fifo",
+            ),
+        ]) else {
+            panic!("expected the sns sink");
+        };
+        assert!(sns.topic_arn.ends_with(".fifo"));
+        let SinkConfig::Redis(redis) = sink(&[
+            ("RELAY__SINK__KIND", "redis"),
+            ("RELAY__SINK__URL", "redis://cache:6379"),
+        ]) else {
+            panic!("expected the redis sink");
+        };
+        assert_eq!(redis.url, "redis://cache:6379");
+        assert_eq!(redis.stream_prefix, "outbox:");
     }
 
     #[test]

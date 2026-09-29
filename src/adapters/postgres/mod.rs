@@ -1,6 +1,7 @@
 //! Postgres source: streams the outbox publication through a logical replication slot.
 //! Why `pgwire-replication`: docs/adr/0001-replication-client.md.
 
+mod dead_letter;
 mod pgoutput;
 
 use std::path::PathBuf;
@@ -11,13 +12,16 @@ use std::time::Duration;
 use anyhow::{Context, anyhow, bail, ensure};
 use percent_encoding::percent_decode_str;
 use pgwire_replication::client::ReplicationEvent;
+use pgwire_replication::tls::rustls::maybe_upgrade_to_tls;
 use pgwire_replication::{PgWireError, ReplicationClient, ReplicationConfig, SslMode, TlsConfig};
 use serde::Deserialize;
+use tokio::net::TcpStream;
 use tokio::sync::{mpsc, watch};
 
 use crate::app::Health;
 use crate::domain::{Lsn, SourceMsg};
 use crate::ports::EventSource;
+pub use dead_letter::PgDeadLetters;
 use pgoutput::{Decoder, Row, outbox_event, pg_time};
 
 /// Wait between attempts while another relay holds the slot or the database is down.
@@ -25,6 +29,8 @@ const CONNECT_RETRY: Duration = Duration::from_secs(5);
 /// How often acks reach Postgres, which bounds the duplicates a crash can cause.
 const FEEDBACK_INTERVAL: Duration = Duration::from_secs(1);
 const SLOT_LAG_INTERVAL: Duration = Duration::from_secs(10);
+/// How long a drain waits for the worker to send the final ack (it reports every FEEDBACK_INTERVAL).
+const FINAL_ACK_TIMEOUT: Duration = Duration::from_secs(5);
 
 #[derive(Debug, Clone, Deserialize)]
 pub struct PgConfig {
@@ -37,27 +43,38 @@ pub struct PgConfig {
 pub struct PgSource {
     config: PgConfig,
     health: Arc<Health>,
+    /// Turns `true` when the relay should drain and stop.
+    stop: watch::Receiver<bool>,
 }
 
 impl PgSource {
-    pub fn new(config: PgConfig, health: Arc<Health>) -> Self {
-        Self { config, health }
+    pub fn new(config: PgConfig, health: Arc<Health>, stop: watch::Receiver<bool>) -> Self {
+        Self {
+            config,
+            health,
+            stop,
+        }
     }
 }
 
 impl EventSource for PgSource {
     async fn run(
-        self,
+        mut self,
         out: mpsc::Sender<SourceMsg>,
         acked: watch::Receiver<Lsn>,
     ) -> anyhow::Result<()> {
         let dsn = Dsn::parse(&self.config.dsn)?;
-        let (client, first) = connect(dsn.replication(&self.config)).await?;
+        let (client, first) = tokio::select! {
+            connected = connect(dsn.replication(&self.config)) => connected?,
+            // A standby waiting for the slot has nothing to drain.
+            () = stopped(&mut self.stop) => return Ok(()),
+        };
+        dead_letter::check(&dsn).await?;
         tracing::info!(slot = %self.config.slot, "streaming from the replication slot");
         self.health.source_ready.store(true, Ordering::Relaxed);
 
         let result = tokio::select! {
-            result = stream(client, first, out, acked) => result,
+            result = stream(client, first, out, acked, self.stop) => result,
             () = poll_slot_lag(&dsn, &self.config.slot) => Ok(()),
         };
         self.health.source_ready.store(false, Ordering::Relaxed);
@@ -100,13 +117,15 @@ fn sqlstate(error: &PgWireError) -> Option<&str> {
     }
 }
 
-/// Forwards events to the relay and the relay's acks to Postgres, until either side stops.
+/// Forwards events to the relay and its acks to Postgres. On `stop`, it stops reading, lets
+/// the core publish what it was sent, and reports the final ack.
 /// Any stream error ends the process: Postgres replays everything unacked on restart.
 async fn stream(
     mut client: ReplicationClient,
     first: ReplicationEvent,
     out: mpsc::Sender<SourceMsg>,
     mut acked: watch::Receiver<Lsn>,
+    mut stop: watch::Receiver<bool>,
 ) -> anyhow::Result<()> {
     let mut transactions = Transactions {
         out,
@@ -123,12 +142,52 @@ async fn stream(
                 let lsn = *acked.borrow_and_update();
                 client.update_applied_lsn(pgwire_replication::Lsn(lsn.0));
             }
+            // Checked between replication events: a commit's messages all go out together,
+            // and a transaction without its commit yet is dropped and replays later.
+            () = stopped(&mut stop) => break,
             event = client.recv() => match event? {
                 Some(event) => transactions.handle(event).await?,
                 None => bail!("the replication stream ended"),
             },
         }
     }
+
+    // Closing `out` lets the core publish what it has; it acks as it goes, then drops `acked`.
+    drop(transactions);
+    while acked.changed().await.is_ok() {
+        let lsn = *acked.borrow_and_update();
+        client.update_applied_lsn(pgwire_replication::Lsn(lsn.0));
+    }
+    let last = *acked.borrow();
+    final_ack(client, last).await
+}
+
+/// Resolves once the relay is asked to stop; never if nobody can ask any more.
+async fn stopped(stop: &mut watch::Receiver<bool>) {
+    if stop.wait_for(|stop| *stop).await.is_err() {
+        std::future::pending().await
+    }
+}
+
+/// `ReplicationClient::stop` sends CopyDone without a last status update, so wait until the
+/// worker has sent `lsn` itself; otherwise the next start replays what was just published.
+async fn final_ack(mut client: ReplicationClient, lsn: Lsn) -> anyhow::Result<()> {
+    client.update_applied_lsn(pgwire_replication::Lsn(lsn.0));
+    let metrics = client.metrics();
+    tokio::time::timeout(FINAL_ACK_TIMEOUT, async {
+        while metrics.last_applied_lsn().0 < lsn.0 {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .context(
+        "the final ack did not reach Postgres; the next start replays what it would have covered",
+    )?;
+    if let Err(error) = client.shutdown().await {
+        tracing::warn!(%error, "closing the replication stream");
+    }
+    tracing::info!(%lsn, "drained; final ack sent");
+    Ok(())
 }
 
 /// Turns replication events into source messages, one committed transaction at a time.
@@ -183,34 +242,20 @@ impl Transactions {
 }
 
 /// Exports how much WAL the slot holds back, i.e. what a stuck relay costs the database.
-// ponytail: plain-text SQL connection only; TLS for SQL connections lands with M2's dead-letter table
 async fn poll_slot_lag(dsn: &Dsn, slot: &str) {
-    if dsn.sslmode != SslMode::Disable {
-        tracing::warn!(
-            "pg_outbox_slot_lag_bytes needs sslmode=disable until SQL connections get TLS (M2); \
-             watch pg_replication_slots from your database monitoring meanwhile"
-        );
-        return std::future::pending().await;
-    }
-    let mut config = tokio_postgres::Config::new();
-    config
-        .host(&dsn.host)
-        .port(dsn.port)
-        .user(&dsn.user)
-        .password(&dsn.password)
-        .dbname(&dsn.dbname);
     loop {
-        match slot_lag(&config, slot).await {
+        match slot_lag(dsn, slot).await {
             Ok(bytes) => metrics::gauge!("pg_outbox_slot_lag_bytes").set(bytes as f64),
-            Err(error) => tracing::warn!(%error, "could not read the slot lag"),
+            Err(error) => {
+                tracing::warn!(error = format!("{error:#}"), "could not read the slot lag")
+            }
         }
         tokio::time::sleep(SLOT_LAG_INTERVAL).await;
     }
 }
 
-async fn slot_lag(config: &tokio_postgres::Config, slot: &str) -> anyhow::Result<i64> {
-    let (client, connection) = config.connect(tokio_postgres::NoTls).await?;
-    tokio::spawn(connection);
+async fn slot_lag(dsn: &Dsn, slot: &str) -> anyhow::Result<i64> {
+    let client = sql_connect(dsn).await?;
     let row = client
         .query_opt(
             "SELECT pg_wal_lsn_diff(pg_current_wal_lsn(), confirmed_flush_lsn)::bigint \
@@ -220,6 +265,23 @@ async fn slot_lag(config: &tokio_postgres::Config, slot: &str) -> anyhow::Result
         .await?
         .with_context(|| format!("replication slot {slot} does not exist"))?;
     Ok(row.get(0))
+}
+
+/// A SQL connection with the replication connection's TLS behavior, for every sslmode:
+/// pgwire-replication negotiates TLS, then tokio-postgres talks over that stream.
+// ponytail: couples SQL TLS to pgwire-replication; switch to tokio-postgres-rustls if it is ever replaced
+async fn sql_connect(dsn: &Dsn) -> anyhow::Result<tokio_postgres::Client> {
+    let tcp = TcpStream::connect((dsn.host.as_str(), dsn.port)).await?;
+    let stream = maybe_upgrade_to_tls(tcp, &dsn.tls(), &dsn.host).await?;
+    let (client, connection) = tokio_postgres::Config::new()
+        .user(&dsn.user)
+        .password(&dsn.password)
+        .dbname(&dsn.dbname)
+        .ssl_mode(tokio_postgres::config::SslMode::Disable) // already negotiated above
+        .connect_raw(stream, tokio_postgres::NoTls)
+        .await?;
+    tokio::spawn(connection);
+    Ok(client)
 }
 
 /// Connection settings from a libpq-style URL.
@@ -276,12 +338,15 @@ impl Dsn {
         Ok(parsed)
     }
 
-    fn replication(&self, config: &PgConfig) -> ReplicationConfig {
-        let tls = TlsConfig {
+    fn tls(&self) -> TlsConfig {
+        TlsConfig {
             mode: self.sslmode,
             ca_pem_path: self.sslrootcert.clone(),
             ..TlsConfig::default()
-        };
+        }
+    }
+
+    fn replication(&self, config: &PgConfig) -> ReplicationConfig {
         ReplicationConfig::new(
             self.host.as_str(),
             self.user.as_str(),
@@ -291,7 +356,7 @@ impl Dsn {
             config.publication.as_str(),
         )
         .with_port(self.port)
-        .with_tls(tls)
+        .with_tls(self.tls())
         // pgoutput sends values as text; pin their format so `created_at` parses the same everywhere.
         .with_options("-c TimeZone=UTC -c DateStyle=ISO")
         .with_status_interval(FEEDBACK_INTERVAL)
