@@ -62,11 +62,17 @@ impl Config {
             .list_separator(",")
             .with_list_parse_key("source.databases")
             .source(env);
-        let config = config::Config::builder()
+        let config: Self = config::Config::builder()
             .add_source(File::new(path, FileFormat::Toml).required(false))
             .add_source(overrides)
             .build()?
             .try_deserialize()?;
+        // Checked before any pipeline starts: each would only fail and retry forever,
+        // with no source-labelled metric for an alert to see.
+        anyhow::ensure!(
+            config.batching.max_events > 0,
+            "batching.max_events must be at least 1"
+        );
         Ok(config)
     }
 }
@@ -187,6 +193,16 @@ mod tests {
         )
         .unwrap();
         assert_eq!(config.source.databases, ["acme", "globex"]);
+    }
+
+    #[test]
+    fn rejects_a_batch_size_of_zero() {
+        let result = Config::from(
+            "relay.example.toml",
+            env(&[("RELAY__BATCHING__MAX_EVENTS", "0")]),
+        );
+        let error = result.expect_err("a batch size of 0 must fail the start");
+        assert!(format!("{error:#}").contains("max_events"), "{error:#}");
     }
 
     #[test]
