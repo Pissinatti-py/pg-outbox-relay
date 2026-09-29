@@ -11,6 +11,10 @@ pub trait EventSource: Send + 'static {
     /// Pushes messages into `out` in commit order, and reports the latest value of
     /// `acked` back to the database as its confirmed position.
     ///
+    /// To stop cleanly, a source drops `out` at a transaction boundary, then keeps reporting
+    /// `acked` until the core drops it: the core has then published everything it was sent,
+    /// and the last value is the final ack.
+    ///
     /// Contract: when started again after a crash, the source resumes from the last
     /// position it reported, so every unacknowledged event is delivered again.
     fn run(

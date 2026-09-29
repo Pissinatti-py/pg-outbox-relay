@@ -11,6 +11,7 @@ use pg_outbox_relay::adapters::postgres::{PgDeadLetters, PgSource};
 use pg_outbox_relay::adapters::sqs::{SqsConfig, SqsSink};
 use pg_outbox_relay::app::Health;
 use pg_outbox_relay::app::relay::{self, Batching, Retry};
+use tokio::sync::watch;
 
 const EVENTS: usize = 60;
 const AGGREGATES: usize = 6;
@@ -26,7 +27,8 @@ async fn relays_outbox_inserts_to_a_fifo_queue_in_per_aggregate_order() -> anyho
 
     // The relay, wired like main.rs.
     let health = Arc::new(Health::default());
-    let source = PgSource::new(pg.config(), health.clone());
+    let (_stop, stopped) = watch::channel(false);
+    let source = PgSource::new(pg.config(), health.clone(), stopped);
     let sink = SqsSink::with_client(
         sqs.clone(),
         SqsConfig {

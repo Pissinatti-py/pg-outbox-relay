@@ -85,6 +85,7 @@ The core may use two facades, much like `log`: `tracing` for logs and `metrics` 
 | **Per-aggregate order** | pgoutput delivers in commit order and the channel is FIFO. A batch holds at most one event per aggregate, and it finishes, retries included, before the next batch starts. So a partial failure cannot let a later event of an aggregate overtake an earlier one. | `domain/batch.rs`, `app/relay.rs` | `batch` unit tests; `retries_retryable_failures_without_reordering`; e2e order check |
 | **Idempotency key** | The outbox `id` becomes the SQS `MessageDeduplicationId` and an `id` message attribute. `MessageGroupId` is `aggregate_type:aggregate_id`, mapped to SQS's character set deterministically. | `adapters/sqs.rs` | `sqs` unit tests; e2e |
 | **Backpressure** | The core stops reading when a batch is due, the channel fills up, and the source waits. | `app/relay.rs` | `a_stalled_sink_holds_the_source_back` |
+| **Clean stop without replays** | On SIGTERM the source stops reading between transactions and closes the channel. The core publishes what it was sent, and `relay::run` waits for the source to report the final ack. The source confirms the replication worker has sent it (`last_applied_lsn`) before closing the stream. | `postgres/mod.rs` (`stream`, `final_ack`), `app/relay.rs`, `main.rs` | `a_clean_stop_hands_the_final_ack_to_the_source`; `sigterm_drains_so_the_next_start_publishes_no_duplicates`; `a_second_signal_stops_a_drain_stuck_on_a_dead_broker` |
 | **No poison-pill stall** | Only rejected *content* is `Permanent`. Call-level failures and unknown entry errors are retried, so a stall is visible and loses nothing. A rejected event is stored before it is confirmed, so the ack never passes an event that is nowhere. | `adapters/sqs.rs` (`classify`), `app/relay.rs` (`dead_letter`) | `dead_letters_a_permanently_rejected_event_and_moves_on`; `a_rejected_event_is_not_acked_until_it_is_dead_lettered`; `classify` tests; `e2e_postgres` |
 
 ## Failure model
@@ -98,7 +99,7 @@ The core may use two facades, much like `log`: `tracing` for logs and `metrics` 
 - **A missing slot fails fast**, with a hint to run `sql/slot.sql`. The relay never creates slots: a recreated slot silently skips everything committed before it existed.
 - **A missing dead-letter table or grant fails fast** at startup, once the database is reachable, instead of stalling at the first rejected event.
 - **Broker errors never crash.** They are retried forever with backoff (100 ms up to 30 s), during which `sink_ready` is false.
-- **Shutdown (M1)** stops immediately on SIGTERM/SIGINT. Unacknowledged events replay on the next start.
+- **Shutdown drains.** On SIGTERM/SIGINT the source stops reading the WAL at a transaction boundary, the core publishes everything already read, the final ack reaches Postgres, and the process exits 0: the next start replays nothing. A standby waiting for the slot exits at once. During a broker outage the drain waits; a second signal (or the orchestrator's SIGKILL) ends it, and unacknowledged events replay.
 
 ## Tests
 
@@ -146,4 +147,4 @@ Each is marked in the code with a `ponytail:` comment naming the upgrade path.
 | A transaction's rows wait for its `Commit` in memory | Very large outbox transactions use memory | Stream in-progress transactions (pgoutput protocol v2) |
 | Channel capacity fixed at 1024 | — | Make it configurable if a benchmark shows it matters |
 | One SQL connection per dead letter | Fine while dead letters are rare | Keep one connection open |
-| Stops immediately on SIGTERM (M1) | Duplicates after deploys | M2: drain in-flight batches, send a final ack |
+| A drain waits for the broker | An outage holds it until SIGKILL or a second signal (safe: unacked events replay) | — |

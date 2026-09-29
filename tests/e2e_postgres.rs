@@ -26,7 +26,8 @@ async fn the_dead_letter_table_is_checked_at_start_and_written_once() -> anyhow:
         .await?;
     let (out, _events) = mpsc::channel(1);
     let (_ack, acked) = watch::channel(Lsn::default());
-    let source = PgSource::new(config.clone(), Arc::new(Health::default()));
+    let (_stop, stopped) = watch::channel(false);
+    let source = PgSource::new(config.clone(), Arc::new(Health::default()), stopped);
     let error = timeout(Duration::from_secs(30), source.run(out, acked))
         .await
         .expect("the relay started without INSERT on the dead-letter table")

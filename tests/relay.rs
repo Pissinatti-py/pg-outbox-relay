@@ -30,6 +30,8 @@ struct SourceProbe {
     acked: Mutex<Option<watch::Receiver<Lsn>>>,
     /// Messages the relay has accepted.
     sent: AtomicUsize,
+    /// The ack the source held when the core finished: what it reports to Postgres last.
+    final_ack: Mutex<Option<Lsn>>,
 }
 
 impl SourceProbe {
@@ -58,20 +60,24 @@ impl EventSource for FakeSource {
     async fn run(
         self,
         out: mpsc::Sender<SourceMsg>,
-        acked: watch::Receiver<Lsn>,
+        mut acked: watch::Receiver<Lsn>,
     ) -> anyhow::Result<()> {
         let FakeSource {
             wal,
             resume_after,
             probe,
         } = self;
-        *probe.acked.lock().unwrap() = Some(acked);
+        *probe.acked.lock().unwrap() = Some(acked.clone());
         for msg in wal.into_iter().filter(|msg| lsn_of(msg) > resume_after) {
             if out.send(msg).await.is_err() {
                 break;
             }
             probe.sent.fetch_add(1, Ordering::SeqCst);
         }
+        // A clean stop, as PgSource does it: close `out`, then follow the acks until the core is done.
+        drop(out);
+        while acked.changed().await.is_ok() {}
+        *probe.final_ack.lock().unwrap() = Some(*acked.borrow());
         Ok(())
     }
 }
@@ -488,4 +494,15 @@ async fn a_transaction_split_across_batches_is_acked_only_once_complete() {
         .await
         .unwrap();
     assert_eq!(ids(&sink.published()), ids(&events));
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_clean_stop_hands_the_final_ack_to_the_source() {
+    let events = events(25, 5);
+    let source = FakeSource::new(&wal(&events), Lsn(0));
+    let probe = source.probe.clone();
+
+    relay(source, FakeSink::default()).await.unwrap();
+
+    assert_eq!(*probe.final_ack.lock().unwrap(), Some(Lsn(2_500)));
 }

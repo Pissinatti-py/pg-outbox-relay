@@ -29,6 +29,8 @@ const CONNECT_RETRY: Duration = Duration::from_secs(5);
 /// How often acks reach Postgres, which bounds the duplicates a crash can cause.
 const FEEDBACK_INTERVAL: Duration = Duration::from_secs(1);
 const SLOT_LAG_INTERVAL: Duration = Duration::from_secs(10);
+/// How long a drain waits for the worker to send the final ack (it reports every FEEDBACK_INTERVAL).
+const FINAL_ACK_TIMEOUT: Duration = Duration::from_secs(5);
 
 #[derive(Debug, Clone, Deserialize)]
 pub struct PgConfig {
@@ -41,28 +43,38 @@ pub struct PgConfig {
 pub struct PgSource {
     config: PgConfig,
     health: Arc<Health>,
+    /// Turns `true` when the relay should drain and stop.
+    stop: watch::Receiver<bool>,
 }
 
 impl PgSource {
-    pub fn new(config: PgConfig, health: Arc<Health>) -> Self {
-        Self { config, health }
+    pub fn new(config: PgConfig, health: Arc<Health>, stop: watch::Receiver<bool>) -> Self {
+        Self {
+            config,
+            health,
+            stop,
+        }
     }
 }
 
 impl EventSource for PgSource {
     async fn run(
-        self,
+        mut self,
         out: mpsc::Sender<SourceMsg>,
         acked: watch::Receiver<Lsn>,
     ) -> anyhow::Result<()> {
         let dsn = Dsn::parse(&self.config.dsn)?;
-        let (client, first) = connect(dsn.replication(&self.config)).await?;
+        let (client, first) = tokio::select! {
+            connected = connect(dsn.replication(&self.config)) => connected?,
+            // A standby waiting for the slot has nothing to drain.
+            () = stopped(&mut self.stop) => return Ok(()),
+        };
         dead_letter::check(&dsn).await?;
         tracing::info!(slot = %self.config.slot, "streaming from the replication slot");
         self.health.source_ready.store(true, Ordering::Relaxed);
 
         let result = tokio::select! {
-            result = stream(client, first, out, acked) => result,
+            result = stream(client, first, out, acked, self.stop) => result,
             () = poll_slot_lag(&dsn, &self.config.slot) => Ok(()),
         };
         self.health.source_ready.store(false, Ordering::Relaxed);
@@ -105,13 +117,15 @@ fn sqlstate(error: &PgWireError) -> Option<&str> {
     }
 }
 
-/// Forwards events to the relay and the relay's acks to Postgres, until either side stops.
+/// Forwards events to the relay and its acks to Postgres. On `stop`, it stops reading, lets
+/// the core publish what it was sent, and reports the final ack.
 /// Any stream error ends the process: Postgres replays everything unacked on restart.
 async fn stream(
     mut client: ReplicationClient,
     first: ReplicationEvent,
     out: mpsc::Sender<SourceMsg>,
     mut acked: watch::Receiver<Lsn>,
+    mut stop: watch::Receiver<bool>,
 ) -> anyhow::Result<()> {
     let mut transactions = Transactions {
         out,
@@ -128,12 +142,52 @@ async fn stream(
                 let lsn = *acked.borrow_and_update();
                 client.update_applied_lsn(pgwire_replication::Lsn(lsn.0));
             }
+            // Checked between replication events: a commit's messages all go out together,
+            // and a transaction without its commit yet is dropped and replays later.
+            () = stopped(&mut stop) => break,
             event = client.recv() => match event? {
                 Some(event) => transactions.handle(event).await?,
                 None => bail!("the replication stream ended"),
             },
         }
     }
+
+    // Closing `out` lets the core publish what it has; it acks as it goes, then drops `acked`.
+    drop(transactions);
+    while acked.changed().await.is_ok() {
+        let lsn = *acked.borrow_and_update();
+        client.update_applied_lsn(pgwire_replication::Lsn(lsn.0));
+    }
+    let last = *acked.borrow();
+    final_ack(client, last).await
+}
+
+/// Resolves once the relay is asked to stop; never if nobody can ask any more.
+async fn stopped(stop: &mut watch::Receiver<bool>) {
+    if stop.wait_for(|stop| *stop).await.is_err() {
+        std::future::pending().await
+    }
+}
+
+/// `ReplicationClient::stop` sends CopyDone without a last status update, so wait until the
+/// worker has sent `lsn` itself; otherwise the next start replays what was just published.
+async fn final_ack(mut client: ReplicationClient, lsn: Lsn) -> anyhow::Result<()> {
+    client.update_applied_lsn(pgwire_replication::Lsn(lsn.0));
+    let metrics = client.metrics();
+    tokio::time::timeout(FINAL_ACK_TIMEOUT, async {
+        while metrics.last_applied_lsn().0 < lsn.0 {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .context(
+        "the final ack did not reach Postgres; the next start replays what it would have covered",
+    )?;
+    if let Err(error) = client.shutdown().await {
+        tracing::warn!(%error, "closing the replication stream");
+    }
+    tracing::info!(%lsn, "drained; final ack sent");
+    Ok(())
 }
 
 /// Turns replication events into source messages, one committed transaction at a time.

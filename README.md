@@ -130,6 +130,8 @@ curl -s localhost:9090/metrics | grep published_total   # the 100 events, plus a
 
 Every event arrives. Any event that was published but not yet acknowledged is sent again with the same `id`, and the FIFO queue drops it as a duplicate.
 
+`docker compose stop relay` sends SIGTERM instead: the relay drains, and the restart replays nothing.
+
 Clean up with `docker compose down -v`.
 
 ## Integrate your application
@@ -427,6 +429,7 @@ The relay reads a TOML file (first argument, default `./relay.toml`), then envir
 
 **Deploy** the Docker image (`docker build -t pg-outbox-relay .`, a distroless image of about 50 MB) or the binary.
 - **High availability:** run **two replicas** against the same slot. Postgres lets only one consume it; the other waits (`/readyz` → 503) and takes over about 5 s after the first one's connection closes. No leader election is needed.
+- **Shutdown:** SIGTERM drains (see [Delivery semantics](#delivery-semantics)). Against a healthy broker that takes well under a second, so the default grace periods (Kubernetes 30 s, `docker stop` 10 s) are plenty.
 - **Kubernetes:** don't make `/readyz` a readiness probe of a Deployment with `maxUnavailable: 0`. The standby is never ready by design, so a rollout would wait forever. Use `strategy: Recreate`, or keep `/readyz` for monitoring only. `/healthz` is the liveness probe.
 
 **Endpoints:**
@@ -476,7 +479,7 @@ To republish one after fixing the cause, insert a corrected row into `outbox` wi
 | The database restarts or the connection drops | The relay exits (crash-only design), the orchestrator restarts it, it waits for the database and resumes from the last ack |
 | A transaction rolls back | It never reaches the WAL stream, so it is never published |
 | SQS rejects an event for good (invalid content, too large) | Stored in `outbox_dead_letter` with the broker's reason (retried until it is), logged at `ERROR`, counted in `pg_outbox_dead_letters_total`, then skipped so one bad row cannot block the stream |
-| SIGTERM (deploys) | M1 stops at once; unacknowledged events are replayed as duplicates. *M2 drains in-flight batches and sends a final ack first* |
+| SIGTERM (deploys) | Stops reading the WAL at a transaction boundary, publishes everything already read, sends a final ack, and exits 0, so the next start replays nothing. During a broker outage the drain waits. A second SIGTERM/SIGINT, or the orchestrator's SIGKILL, stops it, and unacknowledged events replay |
 
 Exactly-once is not a goal. It is the consumer's job, made possible by `id`.
 

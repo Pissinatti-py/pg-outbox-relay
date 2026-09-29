@@ -55,7 +55,8 @@ impl Default for Retry {
 /// Relays events from `source` to `sink` until the source stops.
 ///
 /// A source error is returned right away: nothing unpublished was acked, so a
-/// restart replays it. A clean stop first publishes everything the source sent.
+/// restart replays it. A clean stop first publishes everything the source sent,
+/// then waits for the source to report the final ack.
 pub async fn run<K: EventSink, D: DeadLetterStore>(
     source: impl EventSource,
     sink: K,
@@ -90,15 +91,17 @@ pub async fn run<K: EventSink, D: DeadLetterStore>(
         ack,
         checkpoint: Checkpoint::default(),
     };
+    let source = source.run(tx, acked);
     let core = core.run(rx);
-    tokio::pin!(core);
+    tokio::pin!(source, core);
     tokio::select! {
-        result = source.run(tx, acked) => {
+        result = &mut source => {
             result?;
             core.await;
             Ok(())
         }
-        () = &mut core => Ok(()),
+        // The source stopped sending and the core published the rest: now the source sends the final ack.
+        () = &mut core => source.await,
     }
 }
 
