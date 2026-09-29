@@ -147,12 +147,13 @@ Then run the scripts in `sql/` in this order:
 
 | Script | What it does | Notes |
 |---|---|---|
-| [`sql/outbox.sql`](sql/outbox.sql) | Creates the `outbox` table and the `outbox_pub` publication | Can go in your normal migrations |
-| role (below) | Creates the relay's login | `REPLICATION` is the only privilege it needs |
+| [`sql/outbox.sql`](sql/outbox.sql) | Creates the `outbox` table, the `outbox_pub` publication and the `outbox_dead_letter` table | Can go in your normal migrations |
+| role (below) | Creates the relay's login | `REPLICATION`, plus `INSERT` on `outbox_dead_letter`, are the only privileges it needs |
 | [`sql/slot.sql`](sql/slot.sql) | Creates the `outbox_relay` replication slot | Run **outside a transaction**; the relay never creates slots itself |
 
 ```sql
 CREATE ROLE relay WITH LOGIN REPLICATION PASSWORD '...';
+GRANT INSERT ON outbox_dead_letter TO relay;
 ```
 
 The outbox table:
@@ -407,7 +408,7 @@ The relay reads a TOML file (first argument, default `./relay.toml`), then envir
 
 | Setting | Environment variable | Default | Meaning |
 |---|---|---|---|
-| `source.dsn` | `RELAY__SOURCE__DSN` | required | `postgres://user:password@host:5432/db?sslmode=verify-full&sslrootcert=/ca.pem`. `sslmode`: `disable`, `prefer` (default), `require`, `verify-ca`, `verify-full`. It applies to every connection: replication and slot lag |
+| `source.dsn` | `RELAY__SOURCE__DSN` | required | `postgres://user:password@host:5432/db?sslmode=verify-full&sslrootcert=/ca.pem`. `sslmode`: `disable`, `prefer` (default), `require`, `verify-ca`, `verify-full`. It applies to every connection: replication, slot lag and dead letters |
 | `source.slot` | `RELAY__SOURCE__SLOT` | required | Replication slot, for example `outbox_relay` |
 | `source.publication` | `RELAY__SOURCE__PUBLICATION` | required | Publication, for example `outbox_pub` |
 | `sink.kind` | `RELAY__SINK__KIND` | required | `sqs` |
@@ -444,7 +445,7 @@ The relay reads a TOML file (first argument, default `./relay.toml`), then envir
 | `pg_outbox_publish_errors_total{sink,kind}` | counter | Broker health. `kind` is `retryable` or `permanent` |
 | `pg_outbox_publish_latency_seconds` | histogram | Commit → broker acknowledgement |
 | `pg_outbox_slot_lag_bytes` | gauge | **The main alert signal:** WAL the slot holds back |
-| `pg_outbox_dead_letters_total` | counter | Events skipped as permanently rejected |
+| `pg_outbox_dead_letters_total` | counter | Events rejected for good (stored in `outbox_dead_letter`) |
 | `pg_outbox_channel_depth` | gauge | Backpressure: near 1024 means the broker is the bottleneck |
 
 **Alerts:** [`deploy/prometheus/alerts.yml`](deploy/prometheus/alerts.yml) ships four rules:
@@ -458,6 +459,14 @@ The relay reads a TOML file (first argument, default `./relay.toml`), then envir
 - **Keep outbox rows longer than your longest tolerable outage.** Then any gap can be republished from the table.
 - **Drop the slot if you retire the relay.**
 
+**Dead letters.** An event the broker rejects for good is stored with the broker's reason:
+
+```sql
+SELECT id, reason, failed_at, envelope FROM outbox_dead_letter ORDER BY failed_at;
+```
+
+To republish one after fixing the cause, insert a corrected row into `outbox` with a new `id`, then delete the dead letter. The relay refuses to start without the table or its `INSERT` grant. **Upgrading from M1:** run the `CREATE TABLE outbox_dead_letter` statement from [`sql/outbox.sql`](sql/outbox.sql), then the `GRANT`.
+
 ## Delivery semantics
 
 | Situation | What happens |
@@ -466,7 +475,7 @@ The relay reads a TOML file (first argument, default `./relay.toml`), then envir
 | SQS is down, throttling, or credentials are wrong | Retried forever with backoff. The slot keeps the WAL, `/readyz` turns 503, `OutboxPublishStalled` fires. Nothing is lost |
 | The database restarts or the connection drops | The relay exits (crash-only design), the orchestrator restarts it, it waits for the database and resumes from the last ack |
 | A transaction rolls back | It never reaches the WAL stream, so it is never published |
-| SQS rejects an event for good (invalid content, too large) | Logged at `ERROR` with the full envelope, counted in `pg_outbox_dead_letters_total`, and skipped so one bad row cannot block the stream. *M2 also stores it in an `outbox_dead_letter` table* |
+| SQS rejects an event for good (invalid content, too large) | Stored in `outbox_dead_letter` with the broker's reason (retried until it is), logged at `ERROR`, counted in `pg_outbox_dead_letters_total`, then skipped so one bad row cannot block the stream |
 | SIGTERM (deploys) | M1 stops at once; unacknowledged events are replayed as duplicates. *M2 drains in-flight batches and sends a final ack first* |
 
 Exactly-once is not a goal. It is the consumer's job, made possible by `id`.

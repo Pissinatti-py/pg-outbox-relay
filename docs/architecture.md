@@ -15,7 +15,8 @@ For what the relay is and how to run it, see the [README](../README.md). The ori
             └───────┬─────────────────▲──────────────▲────────┘
                     │ implements      │ implements   │ reads
             ┌───────▼─────────────────┴──────────────┴────────┐
-            │  ports.rs   EventSource · EventSink             │
+            │  ports.rs   EventSource · EventSink ·           │
+            │             DeadLetterStore                     │
             ├─────────────────────────────────────────────────┤
             │  app/       relay::run: the pipeline use case   │
             ├─────────────────────────────────────────────────┤
@@ -48,11 +49,12 @@ The core may use two facades, much like `log`: `tracing` for logs and `metrics` 
 | `src/domain/checkpoint.rs` | `Checkpoint`: the highest LSN that is safe to acknowledge | — |
 | `src/domain/batch.rs` | `take_batch`: at most one event per aggregate per batch | — |
 | `src/domain/backoff.rs` | Exponential backoff with full jitter (pure: jitter is an argument) | — |
-| `src/ports.rs` | `EventSource`, `EventSink`, `PublishError` | domain, tokio channels |
+| `src/ports.rs` | `EventSource`, `EventSink`, `DeadLetterStore`, `PublishError` | domain, tokio channels |
 | `src/app/relay.rs` | `relay::run`: channel → buffer → batch → publish/retry → checkpoint → ack | domain, ports |
 | `src/app/mod.rs` | `Health`: readiness flags behind `/readyz` | — |
 | `src/adapters/postgres/mod.rs` | `PgSource`: connect/retry, the replication stream, acks, the slot-lag poller, DSN parsing, SQL connections over the same TLS | pgwire-replication, tokio-postgres |
 | `src/adapters/postgres/pgoutput.rs` | Decodes pgoutput `Relation` and `Insert`; maps a row to an `OutboxEvent` | domain |
+| `src/adapters/postgres/dead_letter.rs` | `PgDeadLetters`: stores rejected events in `outbox_dead_letter`; the startup check | tokio-postgres |
 | `src/adapters/sqs.rs` | `SqsSink`: envelope → `SendMessageBatch`, call splitting, error classification | aws-sdk-sqs |
 | `src/adapters/http.rs` | `/metrics`, `/healthz`, `/readyz` | axum, metrics-exporter-prometheus |
 | `src/config.rs` | TOML file + `RELAY__…` env overrides → each layer's own settings struct | config |
@@ -71,7 +73,7 @@ The core may use two facades, much like `log`: `tracing` for logs and `metrics` 
 6. **`sink.publish(batch)`** returns one result per event.
    - `Ok` → `checkpoint.confirm(lsn)`.
    - `Retryable` → retried alone after `backoff(attempt)`, before any other batch goes out.
-   - `Permanent` → logged with the full envelope, counted as a dead letter, then confirmed so the stream moves on.
+   - `Permanent` → stored in `outbox_dead_letter` (retried until it is), logged with the full envelope, counted as a dead letter, then confirmed so the stream moves on.
 7. **The ack flows back.** `checkpoint.safe_lsn()` goes into a `watch` channel. `PgSource` passes it to `update_applied_lsn`, and within about 1 s Postgres records it as the slot's `confirmed_flush_lsn`.
 
 ## Why the guarantees hold
@@ -83,7 +85,7 @@ The core may use two facades, much like `log`: `tracing` for logs and `metrics` 
 | **Per-aggregate order** | pgoutput delivers in commit order and the channel is FIFO. A batch holds at most one event per aggregate, and it finishes, retries included, before the next batch starts. So a partial failure cannot let a later event of an aggregate overtake an earlier one. | `domain/batch.rs`, `app/relay.rs` | `batch` unit tests; `retries_retryable_failures_without_reordering`; e2e order check |
 | **Idempotency key** | The outbox `id` becomes the SQS `MessageDeduplicationId` and an `id` message attribute. `MessageGroupId` is `aggregate_type:aggregate_id`, mapped to SQS's character set deterministically. | `adapters/sqs.rs` | `sqs` unit tests; e2e |
 | **Backpressure** | The core stops reading when a batch is due, the channel fills up, and the source waits. | `app/relay.rs` | `a_stalled_sink_holds_the_source_back` |
-| **No poison-pill stall** | Only rejected *content* is `Permanent`. Call-level failures and unknown entry errors are retried, so a stall is visible and loses nothing. | `adapters/sqs.rs` (`classify`) | `skips_a_permanently_rejected_event_and_moves_on`; `classify` tests |
+| **No poison-pill stall** | Only rejected *content* is `Permanent`. Call-level failures and unknown entry errors are retried, so a stall is visible and loses nothing. A rejected event is stored before it is confirmed, so the ack never passes an event that is nowhere. | `adapters/sqs.rs` (`classify`), `app/relay.rs` (`dead_letter`) | `dead_letters_a_permanently_rejected_event_and_moves_on`; `a_rejected_event_is_not_acked_until_it_is_dead_lettered`; `classify` tests; `e2e_postgres` |
 
 ## Failure model
 
@@ -94,6 +96,7 @@ The core may use two facades, much like `log`: `tracing` for logs and `metrics` 
 
   Meanwhile `/readyz` returns 503.
 - **A missing slot fails fast**, with a hint to run `sql/slot.sql`. The relay never creates slots: a recreated slot silently skips everything committed before it existed.
+- **A missing dead-letter table or grant fails fast** at startup, once the database is reachable, instead of stalling at the first rejected event.
 - **Broker errors never crash.** They are retried forever with backoff (100 ms up to 30 s), during which `sink_ready` is false.
 - **Shutdown (M1)** stops immediately on SIGTERM/SIGINT. Unacknowledged events replay on the next start.
 
@@ -142,5 +145,5 @@ Each is marked in the code with a `ponytail:` comment naming the upgrade path.
 | One event per aggregate per batch | A single hot aggregate ships one event per request | Allow same-aggregate runs, and resend the rest of a run when one entry fails |
 | A transaction's rows wait for its `Commit` in memory | Very large outbox transactions use memory | Stream in-progress transactions (pgoutput protocol v2) |
 | Channel capacity fixed at 1024 | — | Make it configurable if a benchmark shows it matters |
-| Poison events only logged (M1) | The envelope lives only in logs | M2: `outbox_dead_letter` table |
+| One SQL connection per dead letter | Fine while dead letters are rare | Keep one connection open |
 | Stops immediately on SIGTERM (M1) | Duplicates after deploys | M2: drain in-flight batches, send a final ack |

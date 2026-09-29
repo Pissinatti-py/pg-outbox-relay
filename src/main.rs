@@ -4,7 +4,7 @@ use std::process::ExitCode;
 use std::sync::Arc;
 
 use pg_outbox_relay::adapters::http;
-use pg_outbox_relay::adapters::postgres::PgSource;
+use pg_outbox_relay::adapters::postgres::{PgDeadLetters, PgSource};
 use pg_outbox_relay::adapters::sqs::SqsSink;
 use pg_outbox_relay::app::{Health, relay};
 use pg_outbox_relay::config::{Config, SinkConfig};
@@ -39,12 +39,21 @@ async fn run() -> anyhow::Result<()> {
     let metrics = http::install_metrics()?;
     let health = Arc::new(Health::default());
 
+    let dead_letters = PgDeadLetters::new(&config.source)?;
     let source = PgSource::new(config.source, health.clone());
     let relay = async {
         let sink = match config.sink {
             SinkConfig::Sqs(sqs) => SqsSink::connect(sqs).await?,
         };
-        relay::run(source, sink, config.batching, config.retry, health.clone()).await
+        relay::run(
+            source,
+            sink,
+            dead_letters,
+            config.batching,
+            config.retry,
+            health.clone(),
+        )
+        .await
     };
 
     // Whichever finishes first ends the process. Crashing is safe: Postgres replays

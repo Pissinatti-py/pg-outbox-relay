@@ -7,7 +7,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use pg_outbox_relay::adapters::http;
-use pg_outbox_relay::adapters::postgres::PgSource;
+use pg_outbox_relay::adapters::postgres::{PgDeadLetters, PgSource};
 use pg_outbox_relay::adapters::sqs::{SqsConfig, SqsSink};
 use pg_outbox_relay::app::Health;
 use pg_outbox_relay::app::relay::{self, Batching, Retry};
@@ -37,6 +37,7 @@ async fn relays_outbox_inserts_to_a_fifo_queue_in_per_aggregate_order() -> anyho
     let relay = tokio::spawn(relay::run(
         source,
         sink,
+        PgDeadLetters::new(&pg.config())?,
         Batching::default(),
         Retry::default(),
         health,

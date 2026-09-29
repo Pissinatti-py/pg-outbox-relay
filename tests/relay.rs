@@ -3,14 +3,14 @@
 //! Time is paused, so batching windows and retry backoffs complete instantly.
 
 use std::collections::{HashMap, HashSet, VecDeque};
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, SystemTime};
 
 use pg_outbox_relay::app::Health;
 use pg_outbox_relay::app::relay::{self, Batching, Retry};
 use pg_outbox_relay::domain::{Lsn, OutboxEvent, SourceMsg};
-use pg_outbox_relay::ports::{EventSink, EventSource, PublishError};
+use pg_outbox_relay::ports::{DeadLetterStore, EventSink, EventSource, PublishError};
 use serde_json::value::RawValue;
 use tokio::sync::{Semaphore, mpsc, watch};
 use tokio::time::timeout;
@@ -146,6 +146,30 @@ impl EventSink for FakeSink {
     }
 }
 
+/// Records dead letters; every store fails while `broken` is set.
+#[derive(Clone, Default)]
+struct FakeDeadLetters {
+    stored: Arc<Mutex<Vec<(String, String)>>>,
+    broken: Arc<AtomicBool>,
+}
+
+impl FakeDeadLetters {
+    fn stored(&self) -> Vec<(String, String)> {
+        self.stored.lock().unwrap().clone()
+    }
+}
+
+impl DeadLetterStore for FakeDeadLetters {
+    async fn store(&self, event: &OutboxEvent, reason: &str) -> anyhow::Result<()> {
+        anyhow::ensure!(!self.broken.load(Ordering::SeqCst), "database unreachable");
+        self.stored
+            .lock()
+            .unwrap()
+            .push((event.id.clone(), reason.to_owned()));
+        Ok(())
+    }
+}
+
 // ---- helpers ----------------------------------------------------------------
 
 fn raw(json: &str) -> Box<RawValue> {
@@ -195,12 +219,22 @@ fn ids(events: &[OutboxEvent]) -> HashSet<String> {
 }
 
 async fn relay(source: FakeSource, sink: FakeSink) -> anyhow::Result<()> {
+    relay_with(source, sink, FakeDeadLetters::default()).await
+}
+
+async fn relay_with(
+    source: FakeSource,
+    sink: FakeSink,
+    dead_letters: FakeDeadLetters,
+) -> anyhow::Result<()> {
+    let health = Arc::new(Health::default());
     relay::run(
         source,
         sink,
+        dead_letters,
         Batching::default(),
         Retry::default(),
-        Arc::new(Health::default()),
+        health,
     )
     .await
 }
@@ -285,26 +319,60 @@ async fn retries_retryable_failures_without_reordering() {
 }
 
 #[tokio::test(start_paused = true)]
-async fn skips_a_permanently_rejected_event_and_moves_on() {
+async fn dead_letters_a_permanently_rejected_event_and_moves_on() {
     let events = events(10, 2);
     let sink = FakeSink::default();
     sink.fail(
         &events[3].id,
         [PublishError::Permanent("message too long".into())],
     );
+    let dead_letters = FakeDeadLetters::default();
     let source = FakeSource::new(&wal(&events), Lsn(0));
     let probe = source.probe.clone();
 
-    relay(source, sink.clone()).await.unwrap();
+    relay_with(source, sink.clone(), dead_letters.clone())
+        .await
+        .unwrap();
 
     let published = ids(&sink.published());
     assert_eq!(published.len(), 9);
     assert!(!published.contains(&events[3].id));
     assert_eq!(
+        dead_letters.stored(),
+        [(events[3].id.clone(), "message too long".to_owned())]
+    );
+    assert_eq!(
         probe.last_ack(),
         Lsn(1_000),
         "the poison event must not block the ack"
     );
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_rejected_event_is_not_acked_until_it_is_dead_lettered() {
+    let events = events(5, 5);
+    let sink = FakeSink::default();
+    sink.fail(
+        &events[2].id,
+        [PublishError::Permanent("message too long".into())],
+    );
+    let dead_letters = FakeDeadLetters::default();
+    dead_letters.broken.store(true, Ordering::SeqCst);
+    let source = FakeSource::new(&wal(&events), Lsn(0));
+    let probe = source.probe.clone();
+
+    let relay = tokio::spawn(relay_with(source, sink, dead_letters.clone()));
+    tokio::time::sleep(Duration::from_secs(60)).await; // the store keeps failing meanwhile
+    assert!(!relay.is_finished());
+    assert!(
+        probe.last_ack() < events[2].commit_lsn,
+        "acked an event that is nowhere"
+    );
+
+    dead_letters.broken.store(false, Ordering::SeqCst);
+    relay.await.unwrap().unwrap();
+    assert_eq!(dead_letters.stored().len(), 1);
+    assert_eq!(probe.last_ack(), Lsn(500));
 }
 
 #[tokio::test(start_paused = true)]

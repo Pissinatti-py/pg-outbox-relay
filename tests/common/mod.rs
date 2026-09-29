@@ -29,7 +29,11 @@ pub struct Pg {
 pub async fn postgres() -> anyhow::Result<Pg> {
     let container = Postgres::default()
         .with_init_sql(include_bytes!("../../sql/outbox.sql").to_vec())
-        .with_init_sql(b"CREATE ROLE relay WITH LOGIN REPLICATION PASSWORD 'relay';".to_vec())
+        .with_init_sql(
+            b"CREATE ROLE relay WITH LOGIN REPLICATION PASSWORD 'relay';
+              GRANT INSERT ON outbox_dead_letter TO relay;"
+                .to_vec(),
+        )
         .with_init_sql(include_bytes!("../../sql/slot.sql").to_vec())
         .with_tag("17")
         .with_cmd([

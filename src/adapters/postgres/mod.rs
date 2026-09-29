@@ -1,6 +1,7 @@
 //! Postgres source: streams the outbox publication through a logical replication slot.
 //! Why `pgwire-replication`: docs/adr/0001-replication-client.md.
 
+mod dead_letter;
 mod pgoutput;
 
 use std::path::PathBuf;
@@ -20,6 +21,7 @@ use tokio::sync::{mpsc, watch};
 use crate::app::Health;
 use crate::domain::{Lsn, SourceMsg};
 use crate::ports::EventSource;
+pub use dead_letter::PgDeadLetters;
 use pgoutput::{Decoder, Row, outbox_event, pg_time};
 
 /// Wait between attempts while another relay holds the slot or the database is down.
@@ -55,6 +57,7 @@ impl EventSource for PgSource {
     ) -> anyhow::Result<()> {
         let dsn = Dsn::parse(&self.config.dsn)?;
         let (client, first) = connect(dsn.replication(&self.config)).await?;
+        dead_letter::check(&dsn).await?;
         tracing::info!(slot = %self.config.slot, "streaming from the replication slot");
         self.health.source_ready.store(true, Ordering::Relaxed);
 
