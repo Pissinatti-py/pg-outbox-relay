@@ -383,3 +383,41 @@ async fn a_stalled_sink_holds_the_source_back() {
         "the source ran {sent} messages ahead of a stalled sink"
     );
 }
+
+#[tokio::test(start_paused = true)]
+async fn a_transaction_split_across_batches_is_acked_only_once_complete() {
+    // One transaction, 15 rows for 15 aggregates: more than one batch holds.
+    let events: Vec<OutboxEvent> = events(15, 15)
+        .into_iter()
+        .map(|event| OutboxEvent {
+            commit_lsn: Lsn(100),
+            ..event
+        })
+        .collect();
+    let mut wal: Vec<SourceMsg> = events.iter().cloned().map(SourceMsg::Event).collect();
+    wal.push(SourceMsg::Progress(Lsn(100)));
+
+    // The first batch is published, then the relay dies inside the second.
+    let sink = FakeSink {
+        crash_on_call: Some(2),
+        ..Default::default()
+    };
+    let source = FakeSource::new(&wal, Lsn(0));
+    let probe = source.probe.clone();
+    let first_run = timeout(Duration::from_secs(60), relay(source, sink.clone())).await;
+    assert!(first_run.is_err());
+    assert_eq!(
+        probe.last_ack(),
+        Lsn(0),
+        "acked a transaction whose events were still in flight"
+    );
+
+    let sink = FakeSink {
+        published: sink.published.clone(),
+        ..Default::default()
+    };
+    relay(FakeSource::new(&wal, probe.last_ack()), sink.clone())
+        .await
+        .unwrap();
+    assert_eq!(ids(&sink.published()), ids(&events));
+}

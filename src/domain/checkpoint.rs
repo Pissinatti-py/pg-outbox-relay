@@ -8,10 +8,14 @@ use super::Lsn;
 /// so it may only be acked once every event committed at or before it has been
 /// published. Each commit LSN the source reports gets an entry counting its
 /// unconfirmed events; the safe LSN is the highest entry with nothing
-/// unconfirmed at or below it.
+/// unconfirmed at or below it, and at or below the last progress the source
+/// reported: until then, more events of that transaction may still be on
+/// their way.
 #[derive(Debug, Default)]
 pub struct Checkpoint {
     unconfirmed: BTreeMap<Lsn, usize>,
+    /// The source has sent every event committed at or before this LSN.
+    observed: Lsn,
     acked: Lsn,
 }
 
@@ -24,6 +28,7 @@ impl Checkpoint {
     /// The source has sent everything up to `lsn` (a commit or a keepalive).
     /// Lets the slot advance while the outbox is idle.
     pub fn observe(&mut self, lsn: Lsn) {
+        self.observed = self.observed.max(lsn);
         self.unconfirmed.entry(lsn).or_default();
     }
 
@@ -39,7 +44,7 @@ impl Checkpoint {
     /// Highest LSN with every event at or before it confirmed. Never moves backwards.
     pub fn safe_lsn(&mut self) -> Lsn {
         while let Some(entry) = self.unconfirmed.first_entry() {
-            if *entry.get() > 0 {
+            if *entry.get() > 0 || *entry.key() > self.observed {
                 break;
             }
             self.acked = self.acked.max(*entry.key());
@@ -73,6 +78,7 @@ mod tests {
         let mut cp = Checkpoint::default();
         for lsn in [10, 20, 30] {
             cp.track(Lsn(lsn));
+            cp.observe(Lsn(lsn));
         }
         cp.confirm(Lsn(10));
         cp.confirm(Lsn(30));
@@ -87,6 +93,23 @@ mod tests {
         cp.observe(Lsn(10));
 
         cp.confirm(Lsn(10));
+        assert_eq!(cp.safe_lsn(), Lsn(0));
+        cp.confirm(Lsn(10));
+        assert_eq!(cp.safe_lsn(), Lsn(10));
+    }
+
+    #[test]
+    fn waits_for_the_commit_before_acking_a_transaction() {
+        let mut cp = Checkpoint::default();
+        cp.track(Lsn(10));
+        cp.confirm(Lsn(10));
+        assert_eq!(
+            cp.safe_lsn(),
+            Lsn(0),
+            "more events of this transaction may follow"
+        );
+        cp.track(Lsn(10));
+        cp.observe(Lsn(10));
         assert_eq!(cp.safe_lsn(), Lsn(0));
         cp.confirm(Lsn(10));
         assert_eq!(cp.safe_lsn(), Lsn(10));
