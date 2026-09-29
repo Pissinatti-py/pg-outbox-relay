@@ -11,6 +11,7 @@ use std::sync::atomic::Ordering;
 use std::time::Duration;
 
 use anyhow::{Context, anyhow, bail, ensure};
+use metrics::Gauge;
 use percent_encoding::{NON_ALPHANUMERIC, percent_decode_str, utf8_percent_encode};
 use pgwire_replication::client::ReplicationEvent;
 use pgwire_replication::tls::rustls::maybe_upgrade_to_tls;
@@ -136,6 +137,7 @@ impl EventSource for PgSource {
         let dsn = Dsn::parse(&self.config.dsn)?;
         // 1 while this relay streams the slot: across replicas, `sum by (source)` shows whether anyone does.
         let up = metrics::gauge!("pg_outbox_source_up", "source" => dsn.dbname.clone());
+        let lag = metrics::gauge!("pg_outbox_slot_lag_bytes", "source" => dsn.dbname.clone());
         up.set(0.0);
         let (client, first) = tokio::select! {
             connected = connect(dsn.replication(&self.config)) => connected?,
@@ -155,10 +157,13 @@ impl EventSource for PgSource {
         };
         let result = tokio::select! {
             result = stream(client, first, transactions, acked, self.stop) => result,
-            () = poll_slot_lag(&dsn, &self.config.slot) => Ok(()),
+            () = poll_slot_lag(&dsn, &self.config.slot, &lag) => Ok(()),
         };
         self.health.source_ready.store(false, Ordering::Relaxed);
         up.set(0.0);
+        // Only the relay streaming the slot reports its lag: after a restart or a takeover,
+        // a stale value here would page forever.
+        lag.set(0.0);
         result
     }
 }
@@ -318,8 +323,7 @@ impl Transactions {
 }
 
 /// Exports how much WAL the slot holds back, i.e. what a stuck relay costs the database.
-async fn poll_slot_lag(dsn: &Dsn, slot: &str) {
-    let lag = metrics::gauge!("pg_outbox_slot_lag_bytes", "source" => dsn.dbname.clone());
+async fn poll_slot_lag(dsn: &Dsn, slot: &str, lag: &Gauge) {
     loop {
         match slot_lag(dsn, slot).await {
             Ok(bytes) => lag.set(bytes as f64),
