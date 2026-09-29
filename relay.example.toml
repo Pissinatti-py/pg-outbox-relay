@@ -10,6 +10,11 @@
 dsn         = "postgres://relay:change-me@db:5432/app?sslmode=verify-full"
 slot        = "outbox_relay"   # created by sql/slot.sql; the relay never creates it
 publication = "outbox_pub"     # created by sql/outbox.sql
+# Several databases on one server (e.g. one per tenant): {database} stands for each name,
+# and every database needs its own slot, since slot names are unique across the server.
+# dsn       = "postgres://relay:change-me@db:5432/{database}?sslmode=verify-full"
+# slot      = "outbox_{database}"
+# databases = ["acme", "globex"]  # env: RELAY__SOURCE__DATABASES=acme,globex
 
 [sink]
 kind      = "sqs"              # sqs | sns | redis

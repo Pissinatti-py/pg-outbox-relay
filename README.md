@@ -17,7 +17,7 @@
 1. [Why](#why)
 2. [How it works](#how-it-works)
 3. [Quickstart (5 minutes)](#quickstart-5-minutes)
-4. [Integrate your application](#integrate-your-application)
+4. [Integrate your application](#integrate-your-application) (including [several databases](#4-several-databases-one-per-tenant))
 5. [Examples](#examples)
 6. [Configure](#configure)
 7. [Operate](#operate)
@@ -231,6 +231,28 @@ Each SQS message body is the envelope shown in the [Quickstart](#quickstart-5-mi
 - **Redis Streams:** each entry has `id`, `source`, `event_type` and `envelope` (the JSON above), in the stream `outbox:<aggregate_type>`. An aggregate's events stay in order within its stream. Read with `XREADGROUP` and deduplicate on `id`. The relay never trims: use `XTRIM <stream> MINID <id>` once every consumer group has passed an entry (`MAXLEN` drops entries a lagging group has not read).
 - **Rows can be deleted** once they are published, for example with a nightly job that deletes rows older than 7 days, or with daily partitions you drop. The WAL already carried them. If you partition `outbox`, create the publication `WITH (publish = 'insert', publish_via_partition_root = true)`.
 
+### 4. Several databases (one per tenant)
+
+One relay can serve every tenant database on a Postgres server, each through its own pipeline. List the databases, and use `{database}` in the DSN and in the slot name, since slot names are unique across the whole server:
+
+```bash
+RELAY__SOURCE__DSN=postgres://relay:...@db:5432/{database}?sslmode=verify-full
+RELAY__SOURCE__SLOT=outbox_{database}
+RELAY__SOURCE__PUBLICATION=outbox_pub
+RELAY__SOURCE__DATABASES=acme,globex,initech
+```
+
+In each tenant database, run `sql/outbox.sql`, grant the relay INSERT on `outbox_dead_letter`, and create the database's slot outside a transaction:
+
+```sql
+SELECT pg_create_logical_replication_slot('outbox_' || current_database(), 'pgoutput');
+```
+
+- **Tenants are isolated.** A database that is down, or whose slot is missing, is retried with a backoff (1 s, growing to 60 s) while every other tenant keeps streaming. `pg_outbox_source_up{source}` and the `OutboxSourceDown` alert show it.
+- **Events carry their database** in `source`, and FIFO groups start with it, so two tenants' `policy:42` never share a group.
+- **Adding a tenant** means adding it to the list and restarting the relay. The restart drains, so nothing replays.
+- **Postgres limits:** raise `max_replication_slots` and `max_wal_senders` above the number of tenants (both default to 10), with a few spare for a standby's connection attempts. Every slot's connection reads the server's whole WAL, so about 30 tenants per server is comfortable.
+
 ## Examples
 
 Three common ways to use the relay with SQS. SNS and Redis Streams work the same way: pick the sink in [Configure](#configure).
@@ -417,9 +439,10 @@ The relay reads a TOML file (first argument, default `./relay.toml`), then envir
 
 | Setting | Environment variable | Default | Meaning |
 |---|---|---|---|
-| `source.dsn` | `RELAY__SOURCE__DSN` | required | `postgres://user:password@host:5432/db?sslmode=verify-full&sslrootcert=/ca.pem`. `sslmode`: `disable`, `prefer` (default), `require`, `verify-ca`, `verify-full`. It applies to every connection: replication, slot lag and dead letters |
-| `source.slot` | `RELAY__SOURCE__SLOT` | required | Replication slot, for example `outbox_relay` |
+| `source.dsn` | `RELAY__SOURCE__DSN` | required | `postgres://user:password@host:5432/db?sslmode=verify-full&sslrootcert=/ca.pem`. `sslmode`: `disable`, `prefer` (default), `require`, `verify-ca`, `verify-full`. It applies to every connection: replication, slot lag and dead letters. With `source.databases`, `{database}` stands for each name |
+| `source.slot` | `RELAY__SOURCE__SLOT` | required | Replication slot, for example `outbox_relay`. With `source.databases`, a template such as `outbox_{database}`: slot names are unique across the server |
 | `source.publication` | `RELAY__SOURCE__PUBLICATION` | required | Publication, for example `outbox_pub` |
+| `source.databases` | `RELAY__SOURCE__DATABASES` | empty | Relay these databases, one pipeline each (comma-separated in the environment). See [Several databases](#4-several-databases-one-per-tenant) |
 | `sink.kind` | `RELAY__SINK__KIND` | required | `sqs`, `sns` or `redis` |
 | `sink.queue_url` | `RELAY__SINK__QUEUE_URL` | required for `sqs` | A `.fifo` URL enables ordering and deduplication |
 | `sink.topic_arn` | `RELAY__SINK__TOPIC_ARN` | required for `sns` | A `.fifo` ARN enables ordering and deduplication |
@@ -438,7 +461,7 @@ The relay reads a TOML file (first argument, default `./relay.toml`), then envir
 ## Operate
 
 **Deploy** the Docker image (`docker build -t pg-outbox-relay .`, a distroless image of about 50 MB) or the binary.
-- **High availability:** run **two replicas** against the same slot. Postgres lets only one consume it; the other waits (`/readyz` → 503) and takes over about 5 s after the first one's connection closes. No leader election is needed.
+- **High availability:** run **two replicas** against the same slot. Postgres lets only one consume it; the other waits (`/readyz` → 503) and takes over about 5 s after the first one's connection closes. No leader election is needed. With several databases, the two replicas share the slots: each is streamed by exactly one of them.
 - **Shutdown:** SIGTERM drains (see [Delivery semantics](#delivery-semantics)). Against a healthy broker that takes well under a second, so the default grace periods (Kubernetes 30 s, `docker stop` 10 s) are plenty.
 - **Kubernetes:** don't make `/readyz` a readiness probe of a Deployment with `maxUnavailable: 0`. The standby is never ready by design, so a rollout would wait forever. Use `strategy: Recreate`, or keep `/readyz` for monitoring only. `/healthz` is the liveness probe.
 
@@ -447,7 +470,7 @@ The relay reads a TOML file (first argument, default `./relay.toml`), then envir
 | Endpoint | Meaning |
 |---|---|
 | `GET /healthz` | 200 when the process is alive |
-| `GET /readyz` | 200 when it streams from the slot **and** the last publish succeeded; 503 otherwise |
+| `GET /readyz` | 200 when at least one of its sources streams from its slot **and** its last publish succeeded; 503 otherwise |
 | `GET /metrics` | Prometheus metrics |
 
 **Metrics:**
@@ -490,7 +513,7 @@ To republish one after fixing the cause, insert a corrected row into `outbox` wi
 |---|---|
 | The relay crashes after publishing, before acknowledging | On restart Postgres replays from the last ack: duplicates with the **same `id`**. FIFO queues drop them within 5 minutes |
 | The broker is down, throttling, or credentials are wrong | Retried forever with backoff. The slot keeps the WAL, `/readyz` turns 503, `OutboxPublishStalled` fires. Nothing is lost |
-| The database restarts or the connection drops | The relay exits (crash-only design), the orchestrator restarts it, it waits for the database and resumes from the last ack |
+| The database restarts or the connection drops | That source's pipeline restarts after a backoff (1 s, growing to 60 s), waits for the database and resumes from its last ack. The other sources keep streaming |
 | A transaction rolls back | It never reaches the WAL stream, so it is never published |
 | The broker (SQS or SNS) rejects an event for good (invalid content, too large) | Stored in `outbox_dead_letter` with the broker's reason (retried until it is), logged at `ERROR`, counted in `pg_outbox_dead_letters_total`, then skipped so one bad row cannot block the stream. Redis never rejects content, so the Redis sink never dead-letters |
 | SIGTERM (deploys) | Stops reading the WAL at a transaction boundary, publishes everything already read, sends a final ack, and exits 0, so the next start replays nothing. During a broker outage the drain waits. A second SIGTERM/SIGINT, or the orchestrator's SIGKILL, stops it, and unacknowledged events replay |

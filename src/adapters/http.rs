@@ -1,5 +1,5 @@
 //! Ops endpoints: `/metrics` (Prometheus), `/healthz` (process alive),
-//! `/readyz` (streaming from the slot and able to publish).
+//! `/readyz` (at least one source streaming from its slot and able to publish).
 
 use std::net::SocketAddr;
 use std::sync::Arc;
@@ -28,7 +28,7 @@ pub fn install_metrics() -> anyhow::Result<PrometheusHandle> {
 pub async fn serve(
     listen: SocketAddr,
     metrics: PrometheusHandle,
-    health: Arc<Health>,
+    health: Vec<Arc<Health>>,
 ) -> anyhow::Result<()> {
     let app = Router::new()
         .route(
@@ -39,7 +39,8 @@ pub async fn serve(
         .route(
             "/readyz",
             get(move || {
-                let ready = health.is_ready();
+                // Any source, not all: with two replicas sharing the slots, neither holds them all.
+                let ready = health.iter().any(|source| source.is_ready());
                 async move {
                     if ready {
                         (StatusCode::OK, "ready")

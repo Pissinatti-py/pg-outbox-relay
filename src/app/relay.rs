@@ -2,6 +2,7 @@
 //! source → bounded channel → buffer → batch → publish/retry → checkpoint → ack → source.
 
 use std::collections::VecDeque;
+use std::future::Future;
 use std::sync::Arc;
 use std::sync::atomic::Ordering;
 use std::time::{Duration, SystemTime};
@@ -10,10 +11,15 @@ use metrics::{Counter, Gauge, Histogram};
 use serde::Deserialize;
 use tokio::sync::{mpsc, watch};
 use tokio::time::{Instant, sleep, sleep_until};
+use tracing::Instrument;
 
-use super::Health;
+use super::{Health, stopped};
 use crate::domain::{Checkpoint, Lsn, OutboxEvent, SourceMsg, backoff, take_batch};
 use crate::ports::{DeadLetterStore, EventSink, EventSource, PublishError};
+
+/// First delay before restarting a failed source, and the most the delay grows to.
+const RESTART_INITIAL: Duration = Duration::from_secs(1);
+const RESTART_MAX: Duration = Duration::from_secs(60);
 
 /// How far the source may run ahead of the sink before it has to wait.
 // ponytail: fixed; make it configurable if a benchmark says it matters
@@ -97,6 +103,41 @@ pub async fn run<K: EventSink, D: DeadLetterStore>(
         }
         // The source stopped sending and the core published the rest: now the source sends the final ack.
         () = &mut core => source.await,
+    }
+}
+
+/// Runs a source's relay until it stops cleanly or the relay stops, restarting it after a
+/// failure. Crash-only, per source: a restart resumes from the slot's last ack, like a
+/// process restart would, so only this source replays and every other source keeps going.
+pub async fn supervise<F>(name: &str, mut stop: watch::Receiver<bool>, mut start: impl FnMut() -> F)
+where
+    F: Future<Output = anyhow::Result<()>>,
+{
+    let mut attempt = 0;
+    loop {
+        let began = Instant::now();
+        let error = match start()
+            .instrument(tracing::info_span!("pipeline", source = name))
+            .await
+        {
+            Ok(()) => return,
+            Err(error) => error,
+        };
+        if began.elapsed() >= RESTART_MAX {
+            attempt = 0; // it ran long enough to count as healthy
+        }
+        let delay = backoff(attempt, RESTART_INITIAL, RESTART_MAX, fastrand::f64());
+        tracing::error!(
+            source = name,
+            error = format!("{error:#}"),
+            retry_in_ms = delay.as_millis() as u64,
+            "source failed, restarting it"
+        );
+        tokio::select! {
+            () = sleep(delay) => {}
+            () = stopped(&mut stop) => return,
+        }
+        attempt = attempt.saturating_add(1);
     }
 }
 

@@ -22,6 +22,7 @@ pub struct SqsConfig {
     pub queue_url: String,
 }
 
+#[derive(Clone)]
 pub struct SqsSink {
     client: Client,
     queue_url: String,

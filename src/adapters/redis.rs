@@ -21,6 +21,7 @@ fn default_stream_prefix() -> String {
     "outbox:".into()
 }
 
+#[derive(Clone)]
 pub struct RedisSink {
     redis: ConnectionManager,
     stream_prefix: String,

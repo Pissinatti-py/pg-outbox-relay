@@ -19,7 +19,7 @@ use serde::Deserialize;
 use tokio::net::TcpStream;
 use tokio::sync::{mpsc, watch};
 
-use crate::app::Health;
+use crate::app::{Health, stopped};
 use crate::domain::{Lsn, SourceMsg};
 use crate::ports::EventSource;
 pub use dead_letter::PgDeadLetters;
@@ -238,13 +238,6 @@ async fn stream(
     final_ack(client, last).await
 }
 
-/// Resolves once the relay is asked to stop; never if nobody can ask any more.
-async fn stopped(stop: &mut watch::Receiver<bool>) {
-    if stop.wait_for(|stop| *stop).await.is_err() {
-        std::future::pending().await
-    }
-}
-
 /// `ReplicationClient::stop` sends CopyDone without a last status update, so wait until the
 /// worker has sent `lsn` itself; otherwise the next start replays what was just published.
 async fn final_ack(mut client: ReplicationClient, lsn: Lsn) -> anyhow::Result<()> {
@@ -443,6 +436,8 @@ impl Dsn {
         .with_tls(self.tls())
         // pgoutput sends values as text; pin their format so `created_at` parses the same everywhere.
         .with_options("-c TimeZone=UTC -c DateStyle=ISO")
+        // ponytail: bounds memory per source (N × 1024 here, and as many in the channels); raise if a benchmark says so
+        .with_buffer_size(1024)
         .with_status_interval(FEEDBACK_INTERVAL)
         .with_wakeup_interval(FEEDBACK_INTERVAL)
     }

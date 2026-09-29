@@ -17,6 +17,7 @@ pub struct SnsConfig {
     pub topic_arn: String,
 }
 
+#[derive(Clone)]
 pub struct SnsSink {
     client: Client,
     topic_arn: String,
