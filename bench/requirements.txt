@@ -1,0 +1,3 @@
+# The M4 baseline relay (bench/polling_relay.py). Install into bench/.venv; see docs/benchmarks.md.
+boto3==1.43.107
+psycopg[binary]==3.3.6

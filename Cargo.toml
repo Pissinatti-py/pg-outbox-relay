@@ -36,3 +36,7 @@ tokio = { version = "1.53.1", features = ["test-util", "macros", "rt-multi-threa
 lto = true
 codegen-units = 1
 strip = true
+
+[[bench]]
+name = "relay"
+harness = false

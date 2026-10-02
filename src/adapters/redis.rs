@@ -49,7 +49,7 @@ impl EventSink for RedisSink {
     const NAME: &'static str = "redis";
 
     /// Redis never rejects an entry for its content, so every failure is retryable.
-    // ponytail: one XADD round trip per event; pipeline the batch if the M4 benchmarks ask for it
+    // ponytail: one XADD round trip per event; pipeline the batch if a benchmark of this sink asks for it
     async fn publish(&self, events: &[OutboxEvent]) -> Vec<Result<(), PublishError>> {
         let mut redis = self.redis.clone();
         let mut results = Vec::with_capacity(events.len());

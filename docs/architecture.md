@@ -119,6 +119,7 @@ The core may use two facades, much like `log`: `tracing` for logs and `metrics` 
 | The Postgres adapter against a real database: the dead-letter table and its startup check | `tests/e2e_postgres.rs` | `cargo test -- --ignored` | Docker |
 | End to end: three tenant databases → the relay binary → one SQS FIFO queue: per-tenant tags and groups, and broken tenants (a missing slot, a severed stream) isolated, then recovering | `tests/e2e_tenants.rs` | `cargo test -- --ignored` | Docker |
 | The relay binary under signals: SIGTERM drains without replays, a second signal ends a stuck drain, SIGKILL loses nothing | `tests/crash.rs` | `cargo test -- --ignored` | Docker |
+| Benchmark: throughput, latency and memory against a Python polling relay ([benchmarks.md](benchmarks.md)) | `benches/relay.rs` | `cargo bench --bench relay` | Docker, `bench/.venv` |
 
 The SQS tests use ElasticMQ, a local SQS, and the SNS test uses moto, because LocalStack now needs an account token. ElasticMQ does not enforce SQS's message-size limit, so the oversized-event path is covered by unit tests only; verify it against real SQS.
 
@@ -152,12 +153,12 @@ Each is marked in the code with a `ponytail:` comment naming the upgrade path.
 
 | Limit | Ceiling | Upgrade when needed |
 |---|---|---|
-| One batch in flight | About 10 events per broker round-trip | Pipeline batches with disjoint aggregates (M4 benchmarks decide) |
-| One event per aggregate per batch | A single hot aggregate ships one event per request | Allow same-aggregate runs, and resend the rest of a run when one entry fails |
+| One batch in flight | About 10 events per broker round-trip: 4,800 events/s against a local SQS (M4), more than a FIFO queue without high throughput accepts | Pipeline batches with disjoint aggregates, once a broker takes more |
+| One event per aggregate per batch | A single hot aggregate ships one event per request: 1,660 events/s (M4), behind the polling relay's 2,860, and at most 300 on a FIFO queue without high throughput | Allow same-aggregate runs, and resend the rest of a run when one entry fails: the first upgrade M4 points to |
 | A transaction's rows wait for its `Commit` in memory | Very large outbox transactions use memory | Stream in-progress transactions (pgoutput protocol v2) |
-| Channel capacity fixed at 1024 | — | Make it configurable if a benchmark shows it matters |
+| Channel capacity fixed at 1024 | Draining 20,000 events peaks at 17 MB of memory (M4) | Make it configurable if a benchmark shows it matters |
 | One SQL connection per dead letter | Fine while dead letters are rare | Keep one connection open |
-| Redis: one `XADD` round trip per event | About 10 round trips per batch | Pipeline the batch if the M4 benchmarks ask for it |
+| Redis: one `XADD` round trip per event | About 10 round trips per batch | Pipeline the batch if a benchmark of the Redis sink asks for it (M4 measured SQS) |
 | A drain waits for the broker | An outage holds it until SIGKILL or a second signal (safe: unacked events replay) | A drain-timeout setting, if grace periods prove too short |
 | The database list is read at startup | Adding a tenant needs a restart (it drains, so nothing replays) | Discover slots by name prefix |
 | One replication connection per database | Each reads the server's whole WAL; about 30 per server is comfortable | Fewer databases per server, or a polling source |
