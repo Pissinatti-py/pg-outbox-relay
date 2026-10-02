@@ -31,7 +31,11 @@ groups:
           severity: page
         annotations:
           summary: "No relay streams {{ $labels.source }}"
-          description: "Its database is down or its slot is missing (see the relay's ERROR logs). Its slot keeps WAL meanwhile."
+          description: >-
+            Its database is down, its slot is missing, or its pipeline keeps failing (see the
+            relay's ERROR logs). An existing slot keeps WAL meanwhile, though its lag reads 0 while
+            no relay streams it. A missing slot keeps nothing: events committed before it is
+            created are never relayed.
 
       - alert: OutboxPublishStalled
         expr: >-

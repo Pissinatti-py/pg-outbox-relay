@@ -81,8 +81,8 @@ async fn relays_outbox_inserts_to_a_fifo_queue_in_per_aggregate_order() -> anyho
 
     // The relay acknowledged everything back to the slot.
     pg.wait_until_acked().await?;
-    // Every metric is labelled with its source, and the slot-lag poller's SQL connection
-    // works over TLS too.
+    // Every metric is labelled with its source. (The SQL connections' TLS is proven by the
+    // dead-letter check every start runs.)
     let rendered = metrics.render();
     assert!(
         exported(&rendered, "pg_outbox_events_published_total", " 60"),
@@ -94,7 +94,7 @@ async fn relays_outbox_inserts_to_a_fifo_queue_in_per_aggregate_order() -> anyho
     );
     assert!(
         exported(&rendered, "pg_outbox_slot_lag_bytes", ""),
-        "no slot lag exported over TLS: {rendered}"
+        "no slot lag exported: {rendered}"
     );
 
     // Once its pipeline stops, a relay no longer reports the slot: with two replicas, a

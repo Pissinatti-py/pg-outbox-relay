@@ -158,7 +158,7 @@ fn entry(index: usize, event: &OutboxEvent, body: &str, fifo: bool) -> PublishBa
     if fifo {
         entry = entry
             .message_group_id(sqs_id(&event.ordering_key()))
-            .message_deduplication_id(sqs_id(&event.id));
+            .message_deduplication_id(sqs_id(&event.dedup_key()));
     }
     entry.build().expect("id and message are set")
 }
@@ -194,7 +194,11 @@ mod tests {
         assert_eq!(entry.id(), "3");
         assert_eq!(entry.message(), event.envelope());
         assert_eq!(entry.message_group_id(), Some("acme:policy:42"));
-        assert_eq!(entry.message_deduplication_id(), Some(event.id.as_str()));
+        // An id is unique only within its database, so tenants never share a dedup id.
+        assert_eq!(
+            entry.message_deduplication_id(),
+            Some("acme:7c9e6679-7425-40de-944b-e07fc1f90ae7")
+        );
         let attributes = entry.message_attributes().unwrap();
         assert_eq!(attributes["id"].string_value(), Some(event.id.as_str()));
         assert_eq!(attributes["source"].string_value(), Some("acme"));

@@ -46,13 +46,13 @@ The core may use two facades, much like `log`: `tracing` for logs and `metrics` 
 
 | File | Responsibility | Depends on |
 |---|---|---|
-| `src/domain/event.rs` | `Lsn`, `OutboxEvent`, the JSON envelope, `ordering_key()`, `SourceMsg` | serde |
+| `src/domain/event.rs` | `Lsn`, `OutboxEvent`, the JSON envelope, `ordering_key()`, `dedup_key()`, `SourceMsg` | serde |
 | `src/domain/checkpoint.rs` | `Checkpoint`: the highest LSN that is safe to acknowledge | — |
 | `src/domain/batch.rs` | `take_batch`: at most one event per aggregate per batch | — |
 | `src/domain/backoff.rs` | Exponential backoff with full jitter (pure: jitter is an argument) | — |
 | `src/ports.rs` | `EventSource`, `EventSink`, `DeadLetterStore`, `PublishError` | domain, tokio channels |
 | `src/app/relay.rs` | `relay::run`: channel → buffer → batch → publish/retry/dead-letter → checkpoint → ack; `relay::supervise`: restarts a failed source's pipeline | domain, ports |
-| `src/app/mod.rs` | `Health`: readiness flags behind `/readyz`; `stopped`: resolves when the relay is asked to stop | — |
+| `src/app/mod.rs` | `Health` and `ready`: what `/readyz` reports; `stopped`: resolves when the relay is asked to stop | — |
 | `src/adapters/postgres/mod.rs` | `PgSource`: connect/retry, the replication stream, acks, the slot-lag poller, DSN parsing, SQL connections over the same TLS | pgwire-replication, tokio-postgres |
 | `src/adapters/postgres/pgoutput.rs` | Decodes pgoutput `Relation` and `Insert`; maps a row to an `OutboxEvent` | domain |
 | `src/adapters/postgres/dead_letter.rs` | `PgDeadLetters`: stores rejected events in `outbox_dead_letter`; the startup check | tokio-postgres |
@@ -86,7 +86,7 @@ The core may use two facades, much like `log`: `tracing` for logs and `metrics` 
 | **At-least-once** | The checkpoint keeps a `BTreeMap<commit LSN, unconfirmed count>`. `safe_lsn` pops fully confirmed entries from the lowest LSN up, and only up to the last `Progress` the source sent, so a transaction split across batches is never acked early. It returns the last one popped, so the ack can never pass an unconfirmed event. A crash only loses unacked progress, which Postgres replays. | `domain/checkpoint.rs` | `checkpoint` unit tests; `a_crash_mid_batch_loses_nothing`; `a_transaction_split_across_batches_is_acked_only_once_complete`; e2e ack check |
 | **Idle slots advance** | With nothing pending, a `Progress` LSN (commit or keepalive) becomes the ack, the same as Postgres' own apply worker. Keepalives received mid-transaction are ignored, because their `wal_end` can sit before that transaction's commit. | `checkpoint.rs`, `postgres/mod.rs` | `idle_progress_advances_the_ack` |
 | **Per-aggregate order** | pgoutput delivers in commit order and the channel is FIFO. A batch holds at most one event per aggregate, and it finishes, retries included, before the next batch starts. So a partial failure cannot let a later event of an aggregate overtake an earlier one. | `domain/batch.rs`, `app/relay.rs` | `batch` unit tests; `retries_retryable_failures_without_reordering`; e2e order check |
-| **Idempotency key** | The outbox `id` becomes the SQS or SNS `MessageDeduplicationId` and an `id` message attribute. `MessageGroupId` is `source:aggregate_type:aggregate_id`, mapped to their character set deterministically. | `adapters/sqs.rs`, `adapters/sns.rs` | `sqs` and `sns` unit tests; e2e |
+| **Idempotency key** | The outbox `id` becomes an `id` message attribute. The SQS or SNS `MessageDeduplicationId` is `source:id` (`dedup_key()`), since an `id` is unique only within its database, and `MessageGroupId` is `source:aggregate_type:aggregate_id`. Both are mapped to their character set deterministically. | `adapters/sqs.rs`, `adapters/sns.rs` | `sqs` and `sns` unit tests; e2e |
 | **Backpressure** | The core stops reading when a batch is due, the channel fills up, and the source waits. | `app/relay.rs` | `a_stalled_sink_holds_the_source_back` |
 | **One source cannot stall another** | Each database runs its own pipeline (channel, checkpoint, batches, dead letters) in its own task, all sharing one sink. `relay::supervise` restarts a failed pipeline alone, after a backoff, and a stop ends its backoff at once. | `app/relay.rs` (`supervise`), `main.rs` (`relay_all`) | `a_failed_source_restarts_and_catches_up`; `stopping_during_a_restart_backoff_returns_at_once`; `one_failing_source_does_not_hold_back_another`; `e2e_tenants` |
 | **Clean stop without replays** | On SIGTERM the source stops reading between transactions and closes the channel. The core publishes what it was sent, and `relay::run` waits for the source to report the final ack. The source confirms the replication worker has sent it (`last_applied_lsn`) before closing the stream. | `postgres/mod.rs` (`stream`, `final_ack`), `app/relay.rs`, `main.rs` | `a_clean_stop_hands_the_final_ack_to_the_source`; `sigterm_drains_so_the_next_start_publishes_no_duplicates`; `a_second_signal_stops_a_drain_stuck_on_a_dead_broker` |
@@ -99,7 +99,7 @@ The core may use two facades, much like `log`: `tracing` for logs and `metrics` 
   - the slot is held by another relay (`55006`): this instance is the HA standby;
   - the database is starting (`57P03`) or unreachable.
 
-  Meanwhile `/readyz` returns 503.
+  Meanwhile that source is not ready: `/readyz` returns 503 unless another source streams.
 - **A missing slot fails that source**, with a hint to run `sql/slot.sql`, and it is retried with the backoff. The relay never creates slots: a recreated slot silently skips everything committed before it existed.
 - **A missing dead-letter table or grant fails that source** as it starts, once the database is reachable, instead of stalling at the first rejected event, and it is retried with the backoff.
 - **Broker errors never crash.** They are retried forever with backoff (100 ms up to 30 s), during which `sink_ready` is false.
@@ -117,6 +117,7 @@ The core may use two facades, much like `log`: `tracing` for logs and `metrics` 
 | End to end: Postgres 17 → relay → SNS FIFO topic → SQS FIFO queue (moto) | `tests/e2e_sns.rs` | `cargo test -- --ignored` | Docker |
 | End to end: Postgres 17 → relay → Redis Streams | `tests/e2e_redis.rs` | `cargo test -- --ignored` | Docker |
 | The Postgres adapter against a real database: the dead-letter table and its startup check | `tests/e2e_postgres.rs` | `cargo test -- --ignored` | Docker |
+| End to end: three tenant databases → the relay binary → one SQS FIFO queue: per-tenant tags and groups, and broken tenants (a missing slot, a severed stream) isolated, then recovering | `tests/e2e_tenants.rs` | `cargo test -- --ignored` | Docker |
 | The relay binary under signals: SIGTERM drains without replays, a second signal ends a stuck drain, SIGKILL loses nothing | `tests/crash.rs` | `cargo test -- --ignored` | Docker |
 
 The SQS tests use ElasticMQ, a local SQS, and the SNS test uses moto, because LocalStack now needs an account token. ElasticMQ does not enforce SQS's message-size limit, so the oversized-event path is covered by unit tests only; verify it against real SQS.

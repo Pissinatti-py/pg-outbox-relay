@@ -65,7 +65,18 @@ impl PgConfig {
     /// One concrete config per source: each entry of `databases`, or this config alone.
     /// Checked up front, so a bad entry fails the start instead of one pipeline.
     pub fn sources(&self) -> anyhow::Result<Vec<PgConfig>> {
-        if self.databases.is_empty() {
+        ensure!(
+            !self.publication.contains(PLACEHOLDER),
+            "source.publication cannot contain {PLACEHOLDER}: every database has its own, under the same name"
+        );
+        // As the environment splits them: `acme, globex,` or an empty variable.
+        let databases: Vec<&str> = self
+            .databases
+            .iter()
+            .map(|database| database.trim())
+            .filter(|database| !database.is_empty())
+            .collect();
+        if databases.is_empty() {
             ensure!(
                 !self.dsn.contains(PLACEHOLDER) && !self.slot.contains(PLACEHOLDER),
                 "source.dsn or source.slot contain {PLACEHOLDER}, but source.databases is empty"
@@ -82,9 +93,9 @@ impl PgConfig {
             self.slot.contains(PLACEHOLDER),
             "source.slot must contain {PLACEHOLDER}: slot names are unique across the whole server"
         );
-        let mut seen = HashSet::new();
-        self.databases
-            .iter()
+        let (mut seen, mut names) = (HashSet::new(), HashSet::new());
+        databases
+            .into_iter()
             .map(|database| {
                 ensure!(
                     seen.insert(database),
@@ -98,7 +109,12 @@ impl PgConfig {
                     databases: Vec::new(),
                 };
                 check_slot_name(&source.slot).with_context(|| format!("database {database}"))?;
-                Dsn::parse(&source.dsn)?;
+                // The database name names the source: it tags its events and labels its metrics.
+                let name = Dsn::parse(&source.dsn)?.dbname;
+                ensure!(
+                    names.insert(name.clone()),
+                    "source.dsn must put {PLACEHOLDER} in the database name, which names each source: several would be named `{name}`"
+                );
                 Ok(source)
             })
             .collect()
@@ -205,7 +221,7 @@ fn sqlstate(error: &PgWireError) -> Option<&str> {
 
 /// Forwards events to the relay and its acks to Postgres. On `stop`, it stops reading, lets
 /// the core publish what it was sent, and reports the final ack.
-/// Any stream error ends the process: Postgres replays everything unacked on restart.
+/// Any stream error ends this source's pipeline: Postgres replays everything unacked when it restarts.
 async fn stream(
     mut client: ReplicationClient,
     first: ReplicationEvent,
@@ -493,7 +509,7 @@ mod tests {
         let sources = config(
             "postgres://relay:pw@db:5432/{database}?sslmode=require",
             "outbox_{database}",
-            &["acme", "acme_corp"],
+            &["acme", " acme_corp", ""], // RELAY__SOURCE__DATABASES=acme, acme_corp,
         )
         .sources()
         .unwrap();
@@ -517,12 +533,15 @@ mod tests {
 
     #[test]
     fn without_databases_the_config_is_its_own_single_source() {
-        let sources = config("postgres://relay@db/app", "outbox_relay", &[])
-            .sources()
-            .unwrap();
-        assert_eq!(sources.len(), 1);
-        assert_eq!(sources[0].database().unwrap(), "app");
-        assert_eq!(sources[0].slot, "outbox_relay");
+        // [""] is an empty RELAY__SOURCE__DATABASES, as templated deployments set it.
+        for databases in [&[][..], &[""]] {
+            let sources = config("postgres://relay@db/app", "outbox_relay", databases)
+                .sources()
+                .unwrap();
+            assert_eq!(sources.len(), 1);
+            assert_eq!(sources[0].database().unwrap(), "app");
+            assert_eq!(sources[0].slot, "outbox_relay");
+        }
     }
 
     #[test]
@@ -540,6 +559,22 @@ mod tests {
                 "acme-corp",
             ),
             (config(dsn, "outbox_{database}", &[]), "databases"),
+            // Every source would be named app: its events and metrics would be indistinguishable.
+            (
+                config(
+                    "postgres://relay@{database}.internal/app",
+                    "outbox_{database}",
+                    &["acme", "globex"],
+                ),
+                "database name",
+            ),
+            (
+                PgConfig {
+                    publication: "outbox_pub_{database}".into(),
+                    ..config(dsn, "outbox_{database}", &["acme"])
+                },
+                "publication",
+            ),
         ] {
             let error = bad.sources().unwrap_err();
             assert!(format!("{error:#}").contains(why), "{error:#}");
