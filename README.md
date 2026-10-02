@@ -533,12 +533,12 @@ A single-database config needs no changes. What consumers and operators see:
 
 Against a Python polling relay (`SELECT … FOR UPDATE SKIP LOCKED`, then `SendMessageBatch` and `DELETE`), on the same Postgres and local SQS, median of 3 runs:
 
-| | pg-outbox-relay | Python polling relay |
-|---|--:|--:|
-| Throughput, 1,000 aggregates | **4,820 events/s** | 2,250 events/s |
-| Throughput, one hot aggregate | 1,660 events/s | **2,860 events/s** |
-| Latency at 200 events/s, p50 / p99 | **12 / 23 ms** | 51 / 102 ms |
-| Peak memory | **17 MB** | 70 MB |
+| | pg-outbox-relay | Python polling relay | pg-outbox-relay vs. polling |
+|---|--:|--:|--:|
+| Throughput, 1,000 aggregates | **4,820 events/s** | 2,250 events/s | **114% more** |
+| Throughput, one hot aggregate | 1,660 events/s | **2,860 events/s** | 42% less |
+| Latency at 200 events/s, p50 / p99 | **12 / 23 ms** | 51 / 102 ms | **76% / 77% lower** |
+| Peak memory | **17.3 MB** | 69.8 MB | **75% less** |
 
 A single hot aggregate is the relay's weak case. It sends one event per request for an aggregate, so a failed entry can never reorder it. [docs/benchmarks.md](docs/benchmarks.md) has the method, the caveats, and how to reproduce it with `cargo bench --bench relay`.
 

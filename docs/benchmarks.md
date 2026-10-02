@@ -4,17 +4,17 @@ Milestone 4 compares the relay with a Python polling relay, the usual alternativ
 
 ## Results
 
-The median of 3 runs, with the range in brackets:
+The median of 3 runs, with the range in brackets. The last column compares the medians:
 
-| | pg-outbox-relay | Python polling relay |
-|---|--:|--:|
-| Throughput: 20,000 events over 1,000 aggregates | **4,820 events/s** (4,430–4,900) | 2,250 events/s (1,900–2,490) |
-| Throughput: 2,000 events on one aggregate | 1,660 events/s (1,655–1,661) | **2,860 events/s** (2,500–3,050) |
-| Latency at 200 events/s: p50 | **12 ms** | 51 ms |
-| Latency: p99 | **23 ms** | 102 ms |
-| Latency: max | **59 ms** (30–67) | 151 ms (116–192) |
-| Peak memory (RSS) | **17.3 MB** | 69.8 MB |
-| Memory under load (RSS) | **15.6 MB** | 67.2 MB |
+| | pg-outbox-relay | Python polling relay | pg-outbox-relay vs. polling |
+|---|--:|--:|--:|
+| Throughput: 20,000 events over 1,000 aggregates | **4,820 events/s** (4,430–4,900) | 2,250 events/s (1,900–2,490) | **114% more** |
+| Throughput: 2,000 events on one aggregate | 1,660 events/s (1,655–1,661) | **2,860 events/s** (2,500–3,050) | 42% less |
+| Latency at 200 events/s: p50 | **12 ms** | 51 ms | **76% lower** |
+| Latency: p99 | **23 ms** | 102 ms | **77% lower** |
+| Latency: max | **59 ms** (30–67) | 151 ms (116–192) | **61% lower** |
+| Peak memory (RSS) | **17.3 MB** | 69.8 MB | **75% less** |
+| Memory under load (RSS) | **15.6 MB** | 67.2 MB | **77% less** |
 
 What it shows:
 - **Over many aggregates, the relay drains a backlog about twice as fast**, with a quarter of the memory.
