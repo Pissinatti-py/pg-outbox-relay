@@ -8,7 +8,7 @@
 - **Ordered per aggregate:** events of the same `aggregate_type` + `aggregate_id` arrive in commit order.
 - **Idempotent consumers made easy:** every event carries a stable `id` to deduplicate on.
 
-> **Status: milestone 4.** One relay serves many tenant databases (one slot each), publishing to SQS, SNS or Redis Streams. [Benchmarks](#benchmarks) compare it with a Python polling relay.
+> One relay serves many tenant databases (one slot each), publishing to SQS, SNS or Redis Streams. [Benchmarks](#benchmarks) compare it with a Python polling relay.
 
 ---
 
@@ -22,10 +22,9 @@
 6. [Configure](#configure)
 7. [Operate](#operate)
 8. [Delivery semantics](#delivery-semantics)
-9. [Upgrading from M2](#upgrading-from-m2)
+9. [Upgrading from 0.2](#upgrading-from-02)
 10. [Benchmarks](#benchmarks)
 11. [Develop](#develop)
-12. [Roadmap](#roadmap)
 
 ---
 
@@ -43,7 +42,7 @@ Those two writes cannot be atomic. Publishing after the commit can lose the even
 
 The **transactional outbox** pattern closes it. The application writes the event into an `outbox` table **in the same transaction** as the business change, so the event exists exactly when the change does. A separate relay then publishes committed outbox rows.
 
-Debezium with Kafka Connect does this too, but it brings a JVM, Kafka and connectors. `pg-outbox-relay` is for teams that already run Postgres and SQS, SNS or Redis: **one binary (about 15 MB), one config, Prometheus metrics.**
+Debezium with Kafka Connect does this too, but it brings a JVM, Kafka and connectors. `pg-outbox-relay` is for teams that already run Postgres and SQS, SNS or Redis: **one binary (about 15 MB), one config, Prometheus metrics.** It isn't general-purpose CDC for arbitrary tables (Debezium is), a schema registry or a routing DSL.
 
 ## How it works
 
@@ -507,7 +506,7 @@ The relay reads a TOML file (first argument, default `./relay.toml`), then envir
 SELECT id, reason, failed_at, envelope FROM outbox_dead_letter ORDER BY failed_at;
 ```
 
-To republish one after fixing the cause, insert a corrected row into `outbox` with a new `id`, then delete the dead letter. The relay refuses to start without the table or its `INSERT` grant. **Upgrading from M1:** run the `CREATE TABLE outbox_dead_letter` statement from [`sql/outbox.sql`](sql/outbox.sql), then the `GRANT`.
+To republish one after fixing the cause, insert a corrected row into `outbox` with a new `id`, then delete the dead letter. The relay refuses to start without the table or its `INSERT` grant. **Upgrading from 0.1:** run the `CREATE TABLE outbox_dead_letter` statement from [`sql/outbox.sql`](sql/outbox.sql), then the `GRANT`.
 
 ## Delivery semantics
 
@@ -522,13 +521,13 @@ To republish one after fixing the cause, insert a corrected row into `outbox` wi
 
 Exactly-once is not a goal. It is the consumer's job, made possible by `id`.
 
-## Upgrading from M2
+## Upgrading from 0.2
 
 A single-database config needs no changes. What consumers and operators see:
 - **Events gain `source`**, the database they were committed in: a field in the envelope, a `source` message attribute on SQS and SNS, a `source` field on Redis Streams.
 - **FIFO `MessageGroupId` and `MessageDeduplicationId` gain a `<database>:` prefix.** An aggregate's last event before the upgrade and its first event after it land in different groups, so drain the queue before upgrading if that ordering matters. An event replayed across the upgrade is not deduplicated by the queue; consumers deduplicate on `id` anyway.
 - **Every metric gains a `source` label.** The shipped alerts and dashboard are updated, and there is a new `pg_outbox_source_up` gauge and `OutboxSourceDown` alert.
-- **A source error no longer exits the process.** A database that is down or a missing slot restarts that source's pipeline after a backoff, and `pg_outbox_source_up` shows it.
+- **A source error no longer exits the process.** An unreachable database is retried every 5 s, and a failed source (a missing slot, for example) restarts after a backoff that grows to 60 s. `pg_outbox_source_up` shows it.
 
 ## Benchmarks
 
@@ -550,7 +549,7 @@ Prerequisites: Rust 1.94.1 or newer (the AWS SDK sets that minimum) and Docker f
 ```bash
 cargo test                          # unit, core and architecture tests: fast, no Docker
 cargo test -- --ignored             # end to end (SQS, SNS, Redis, dead letters) and the crash tests: the relay binary under SIGTERM and SIGKILL
-cargo bench --bench relay           # the M4 benchmarks: Docker and bench/.venv (docs/benchmarks.md)
+cargo bench --bench relay           # benchmarks against a Python polling relay: Docker and bench/.venv (docs/benchmarks.md)
 cargo fmt --check && cargo clippy --all-targets -- -D warnings
 cargo run -- relay.toml             # against your own Postgres and broker
 ```
@@ -566,7 +565,7 @@ src/
 ├── config.rs    TOML + RELAY__ env → every layer's settings
 └── main.rs      composition root
 tests/           relay.rs (core, with fakes), architecture.rs; Docker: e2e_*.rs, crash.rs, common/
-benches/         relay.rs: the M4 benchmark
+benches/         relay.rs: the benchmark against the polling relay
 bench/           polling_relay.py: the Python relay it compares against
 sql/             outbox table + publication, replication slot
 deploy/          demo configs: Postgres init, ElasticMQ, Prometheus + alerts, Grafana
@@ -580,17 +579,6 @@ docs/            architecture.md, benchmarks.md, adr/, spec.md (the original des
 - the known limits and their upgrade paths.
 
 Decisions are recorded in [docs/adr/](docs/adr/), for example why the replication client is `pgwire-replication`.
-
-## Roadmap
-
-| Milestone | Scope | Status |
-|---|---|---|
-| **M1** | Replication source, SQS FIFO sink, LSN checkpointing, metrics and health, Docker Compose demo, end-to-end test | ✅ done |
-| **M2** | SNS and Redis Streams sinks, `outbox_dead_letter` table, graceful drain on SIGTERM, TLS for SQL connections, process-kill crash test in CI | ✅ done |
-| **M3** | Multi-source: one process relays N databases (one slot per tenant database) | ✅ done |
-| **M4** | Benchmarks (events/s, p99 latency, memory) against a Python polling relay | ✅ done |
-
-Non-goals: exactly-once end to end, general-purpose CDC for arbitrary tables (use Debezium), and schema registries or routing DSLs.
 
 ## License
 
