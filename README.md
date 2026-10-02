@@ -250,7 +250,7 @@ SELECT pg_create_logical_replication_slot('outbox_' || current_database(), 'pgou
 ```
 
 - **Tenants are isolated.** A database that is down, or whose slot is missing, is retried with a backoff (1 s, growing to 60 s) while every other tenant keeps streaming. `pg_outbox_source_up{source}` and the `OutboxSourceDown` alert show it.
-- **Events carry their database** in `source`, and FIFO groups start with it, so two tenants' `policy:42` never share a group.
+- **Events carry their database** in `source`, and FIFO group and deduplication ids start with it: two tenants' `policy:42` never share a group, and a FIFO queue never drops one tenant's event as a duplicate of another's. An `id` is unique only within its database, so unless your ids are random UUIDs, consumers deduplicate on `source` and `id`.
 - **Adding a tenant** means adding it to the list and restarting the relay. The restart drains, so nothing replays.
 - **Postgres limits:** raise `max_replication_slots` and `max_wal_senders` above the number of tenants (both default to 10), with a few spare for a standby's connection attempts. Every slot's connection reads the server's whole WAL, so about 30 tenants per server is comfortable.
 
@@ -525,7 +525,7 @@ Exactly-once is not a goal. It is the consumer's job, made possible by `id`.
 
 A single-database config needs no changes. What consumers and operators see:
 - **Events gain `source`**, the database they were committed in: a field in the envelope, a `source` message attribute on SQS and SNS, a `source` field on Redis Streams.
-- **FIFO `MessageGroupId` gains a `<database>:` prefix.** An aggregate's last event before the upgrade and its first event after it land in different groups, so drain the queue before upgrading if that ordering matters.
+- **FIFO `MessageGroupId` and `MessageDeduplicationId` gain a `<database>:` prefix.** An aggregate's last event before the upgrade and its first event after it land in different groups, so drain the queue before upgrading if that ordering matters. An event replayed across the upgrade is not deduplicated by the queue; consumers deduplicate on `id` anyway.
 - **Every metric gains a `source` label.** The shipped alerts and dashboard are updated, and there is a new `pg_outbox_source_up` gauge and `OutboxSourceDown` alert.
 - **A source error no longer exits the process.** A database that is down or a missing slot restarts that source's pipeline after a backoff, and `pg_outbox_source_up` shows it.
 

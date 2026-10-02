@@ -45,6 +45,11 @@ impl OutboxEvent {
         )
     }
 
+    /// Brokers drop events repeating this key. `id` is unique only within its database.
+    pub fn dedup_key(&self) -> String {
+        format!("{}:{}", self.source, self.id)
+    }
+
     /// The JSON document consumers receive.
     pub fn envelope(&self) -> String {
         #[derive(Serialize)]
@@ -107,6 +112,10 @@ mod tests {
         };
 
         assert_eq!(event.ordering_key(), "acme:policy:42");
+        assert_eq!(
+            event.dedup_key(),
+            "acme:0b7e5c1e-2f4a-4c33-9d7e-9a4f1c2b3d4e"
+        );
         assert_eq!(
             event.envelope(),
             r#"{"id":"0b7e5c1e-2f4a-4c33-9d7e-9a4f1c2b3d4e","source":"acme","aggregate_type":"policy","aggregate_id":"42","event_type":"policy.approved","occurred_at":"2026-09-28T14:03:11Z","headers":{"tenant": "acme"},"payload":{"policy_id": 42}}"#
