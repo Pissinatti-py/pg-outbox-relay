@@ -8,7 +8,7 @@
 - **Ordered per aggregate:** events of the same `aggregate_type` + `aggregate_id` arrive in commit order.
 - **Idempotent consumers made easy:** every event carries a stable `id` to deduplicate on.
 
-> **Status: milestone 4.** One relay serves many tenant databases (one slot each), publishing to SQS, SNS or Redis Streams. [Benchmarks](#benchmarks) compare it with a Python polling relay.
+> One relay serves many tenant databases (one slot each), publishing to SQS, SNS or Redis Streams. [Benchmarks](#benchmarks) compare it with a Python polling relay.
 
 ---
 
@@ -18,14 +18,12 @@
 2. [How it works](#how-it-works)
 3. [Quickstart (5 minutes)](#quickstart-5-minutes)
 4. [Integrate your application](#integrate-your-application) (including [several databases](#4-several-databases-one-per-tenant))
-5. [Examples](#examples)
+5. [Example: order paid → fulfillment](#example-order-paid--fulfillment-worker)
 6. [Configure](#configure)
 7. [Operate](#operate)
 8. [Delivery semantics](#delivery-semantics)
-9. [Upgrading from M2](#upgrading-from-m2)
-10. [Benchmarks](#benchmarks)
-11. [Develop](#develop)
-12. [Roadmap](#roadmap)
+9. [Benchmarks](#benchmarks)
+10. [Develop](#develop)
 
 ---
 
@@ -43,7 +41,7 @@ Those two writes cannot be atomic. Publishing after the commit can lose the even
 
 The **transactional outbox** pattern closes it. The application writes the event into an `outbox` table **in the same transaction** as the business change, so the event exists exactly when the change does. A separate relay then publishes committed outbox rows.
 
-Debezium with Kafka Connect does this too, but it brings a JVM, Kafka and connectors. `pg-outbox-relay` is for teams that already run Postgres and SQS, SNS or Redis: **one binary (about 15 MB), one config, Prometheus metrics.**
+Debezium with Kafka Connect does this too, but it brings a JVM, Kafka and connectors. `pg-outbox-relay` is for teams that already run Postgres and SQS, SNS or Redis: **one binary (about 15 MB), one config, Prometheus metrics.** It isn't general-purpose CDC for arbitrary tables (Debezium is), a schema registry or a routing DSL.
 
 ## How it works
 
@@ -102,7 +100,7 @@ curl -s localhost:9324 \
        "MessageSystemAttributeNames": ["MessageGroupId"], "MessageAttributeNames": ["All"]}'
 ```
 
-The message body is the event envelope, and `source` is the database it was committed in. `MessageGroupId` is `app:policy:42`, and the event `id` is also the FIFO deduplication id:
+The message body is the event envelope, and `source` is the database it was committed in. `MessageGroupId` is `app:policy:42`, and the FIFO deduplication id is `app:` followed by the event `id`:
 
 ```json
 {"id":"0fafad7a-fd18-4f77-a13e-3dd92bd7ac61","source":"app","aggregate_type":"policy","aggregate_id":"42","event_type":"policy.approved","occurred_at":"2026-09-28T16:21:58.774339Z","headers":{"tenant": "acme"},"payload":{"policy_id": 42}}
@@ -228,7 +226,7 @@ If the transaction rolls back, the event never existed. If it commits, it will b
 
 Each SQS message body is the envelope shown in the [Quickstart](#quickstart-5-minutes). Keep these in mind:
 - **Deduplicate on `id`.** Delivery is at-least-once. A FIFO queue drops duplicates within its 5-minute deduplication window. Beyond that, record processed ids, for example with a processed-events table or a Redis `SET NX`.
-- **FIFO queues** deliver each aggregate's events in commit order (`MessageGroupId = source:aggregate_type:aggregate_id`). **Standard queues** also work but do not keep order; the `id` is available as a message attribute there too.
+- **FIFO queues** deliver each aggregate's events in commit order: `MessageGroupId` is `source:aggregate_type:aggregate_id`, and `MessageDeduplicationId` is `source:id`. Before 0.3 neither had the `source:` prefix, so when upgrading from 0.2, drain FIFO queues first if an aggregate's order across the upgrade matters. **Standard queues** also work but do not keep order; `id`, `event_type` and `source` are message attributes there too.
 - **SNS:** subscribe queues with raw message delivery, so the body is the envelope. `id`, `event_type` and `source` are message attributes, usable in subscription filter policies. A `.fifo` topic keeps the same per-aggregate order and delivers to `.fifo` queues.
 - **Redis Streams:** each entry has `id`, `source`, `event_type` and `envelope` (the JSON above), in the stream `outbox:<aggregate_type>`. An aggregate's events stay in order within its stream. Read with `XREADGROUP` and deduplicate on `id`. The relay never trims: use `XTRIM <stream> MINID <id>` once every consumer group has passed an entry (`MAXLEN` drops entries a lagging group has not read).
 - **Rows can be deleted** once they are published, for example with a nightly job that deletes rows older than 7 days, or with daily partitions you drop. The WAL already carried them. If you partition `outbox`, create the publication `WITH (publish = 'insert', publish_via_partition_root = true)`.
@@ -255,19 +253,9 @@ SELECT pg_create_logical_replication_slot('outbox_' || current_database(), 'pgou
 - **Adding a tenant** means adding it to the list and restarting the relay. The restart drains, so nothing replays. **Removing one** means taking it off the list, restarting, then dropping its slot (`SELECT pg_drop_replication_slot('outbox_<name>')`): a slot nobody reads keeps WAL for the whole server, and once its source is off the list, no alert sees it.
 - **Postgres limits:** raise `max_replication_slots` and `max_wal_senders` above the number of tenants (both default to 10), with a few spare for a standby's connection attempts. Every slot's connection reads the server's whole WAL, so about 30 tenants per server is comfortable.
 
-## Examples
+## Example: order paid → fulfillment worker
 
-Three common ways to use the relay with SQS. SNS and Redis Streams work the same way: pick the sink in [Configure](#configure).
-
-| Example | Queue | Why that queue | The idea to take away |
-|---|---|---|---|
-| [Order paid → fulfillment](#example-1-order-paid--fulfillment-worker) | FIFO | Each order's events must be handled in sequence | One aggregate = one ordered stream |
-| [Policy approved → e-mail](#example-2-policy-approved--notification-e-mail) | Standard | No ordering needed, higher throughput | Replace `on_commit` side effects; send each e-mail once |
-| [Search index in sync](#example-3-keeping-a-search-index-in-sync) | FIFO | Each document's updates must apply in sequence | State-carrying events, a version guard, fan-out with a second relay |
-
-The consumer snippets are sketches of the `handle(message)` step. Around it runs the usual SQS loop: long-poll `ReceiveMessage`, call `handle`, then `DeleteMessage` once it returns.
-
-### Example 1: Order paid → fulfillment worker
+How the relay fits a typical flow, with SQS. SNS and Redis Streams work the same way: pick the sink in [Configure](#configure).
 
 **The problem.** When an order is paid, the fulfillment service reserves stock and ships it.
 - **Separate commit and publish can go wrong both ways.** A crash between the commit and the publish leaves a paid order that never ships. Publishing first can ship an order whose payment then rolls back.
@@ -294,7 +282,7 @@ RELAY__SINK__QUEUE_URL=https://sqs.us-east-1.amazonaws.com/123456789012/fulfillm
 
 Every event of order 1234 carries `MessageGroupId = app:order:1234` (`app` being its database). SQS FIFO releases the next message of a group only after the previous one is deleted, so `order.cancelled` waits until `order.paid` has been handled. Different orders are still processed in parallel.
 
-**Worker (sketch):** record the event `id` in the same database transaction as the work.
+**Worker (sketch):** record the event `id` in the same database transaction as the work. Around this `handle(message)` runs the usual SQS loop: long-poll `ReceiveMessage`, call `handle`, then `DeleteMessage` once it returns.
 
 ```python
 def handle(message):
@@ -314,126 +302,6 @@ def handle(message):
 - **The payment and its event commit together.** There is no lost `order.paid` and no event for a payment that rolled back.
 - **The group ID keeps each order in sequence.**
 - **The `processed_events` row commits together with the stock change.** If the work fails, both roll back and the message is retried. If the relay replays the event after a crash, the unique `id` turns it into a no-op.
-
-### Example 2: Policy approved → notification e-mail
-
-**The problem.** Django apps often trigger side effects with `transaction.on_commit`:
-
-```python
-with transaction.atomic():
-    policy.status = "approved"
-    policy.save()
-    transaction.on_commit(lambda: send_approval_email.delay(policy.id))
-```
-
-The callback runs in the same process, after the commit. If the process dies at that moment, or the Celery broker is unreachable, the task is never queued: the policy is approved and nobody is told. It is the dual write again, just harder to notice.
-
-**Producer:** one more row in the same transaction. This uses the `Outbox` model from [Integrate your application](#2-insert-events-in-the-same-transaction-as-your-change).
-
-```python
-with transaction.atomic():
-    policy.status = "approved"
-    policy.save()
-    Outbox.objects.create(
-        aggregate_type="policy",
-        aggregate_id=str(policy.id),
-        event_type="policy.approved",
-        payload={"policy_id": policy.id, "holder_email": policy.holder_email},
-        headers={"tenant": tenant.slug},
-    )
-```
-
-**Relay:** a standard queue is enough, because e-mails need no ordering.
-
-```bash
-RELAY__SINK__QUEUE_URL=https://sqs.us-east-1.amazonaws.com/123456789012/notifications
-```
-
-Standard queues don't deduplicate, and SQS itself can deliver a message twice. The relay therefore also puts the event `id`, `event_type` and `source` in message attributes, so the worker can check them without parsing the body.
-
-**Worker (sketch):**
-
-```python
-def handle(message):
-    event = json.loads(message["Body"])
-    if event["event_type"] != "policy.approved":
-        return  # every outbox event reaches this queue; skip the ones that aren't notifications
-    key = f"notified:{event['id']}"
-    if redis.exists(key):
-        return  # this event was already e-mailed
-    send_email(
-        to=event["payload"]["holder_email"],
-        template="policy_approved",
-        tenant=event["headers"]["tenant"],
-    )
-    redis.set(key, 1, ex=7 * 24 * 3600)  # marked after sending, so a failed send is retried
-```
-
-A crash between sending and marking can still send one duplicate. If your e-mail provider supports idempotency keys, pass `event["id"]` and that gap closes too.
-
-### Example 3: Keeping a search index in sync
-
-**The problem.** Products are edited in Postgres and searched in Elasticsearch or OpenSearch. The same applies to a cache or a reporting database. Updating the index inside the request is another dual write. A failed index call leaves search stale for good, or fails the user's request over something secondary.
-
-**Producer:** publish the product's *new state*, including a version that increases with every change. One statement does both:
-
-```sql
-WITH p AS (
-    UPDATE products SET price_cents = 1990, version = version + 1 WHERE id = 7
-    RETURNING id, name, price_cents, version
-)
-INSERT INTO outbox (id, aggregate_type, aggregate_id, event_type, payload)
-SELECT gen_random_uuid(), 'product', p.id::text, 'product.updated', to_jsonb(p) FROM p;
-```
-
-The consumer receives `"payload": {"id": 7, "name": "Blue mug", "version": 12, "price_cents": 1990}`. The indexer never has to query the database, and the version lets it ignore anything older than what it already has.
-
-**Relay:** a FIFO queue, so each product's updates arrive in sequence.
-
-```bash
-RELAY__SINK__QUEUE_URL=https://sqs.us-east-1.amazonaws.com/123456789012/search-indexer.fifo
-```
-
-**Indexer (sketch):** use Elasticsearch/OpenSearch external versioning.
-
-```python
-def handle(message):
-    event = json.loads(message["Body"])
-    doc = event["payload"]
-    try:
-        if event["event_type"] == "product.updated":
-            es.index(index="products", id=doc["id"], document=doc,
-                     version=doc["version"], version_type="external")
-        elif event["event_type"] == "product.deleted":
-            es.delete(index="products", id=doc["id"],
-                      version=doc["version"], version_type="external")
-    except ConflictError:
-        pass  # the index already holds this version or a newer one: a duplicate or stale event
-```
-
-**Feeding several services from the same events (fan-out).** A relay publishes to one queue. To deliver the same events to both the search indexer and the notification service, run **one relay per queue**, each with its own replication slot:
-
-```sql
-SELECT pg_create_logical_replication_slot('outbox_search', 'pgoutput');  -- outside a transaction
-```
-
-```bash
-RELAY__SOURCE__SLOT=outbox_search
-RELAY__SINK__QUEUE_URL=https://sqs.us-east-1.amazonaws.com/123456789012/search-indexer.fifo
-```
-
-Each relay reads the same publication and acknowledges its own slot:
-- **Independence:** a slow indexer never delays notifications.
-- **Cost:** each slot also keeps WAL until its own relay catches up, so watch `pg_outbox_slot_lag_bytes` for every relay.
-
-Or publish to an SNS topic instead: one relay and one slot, and each service subscribes its own queue (raw message delivery on), with a filter policy on `event_type` if it only needs some events.
-
-```bash
-RELAY__SINK__KIND=sns
-RELAY__SINK__TOPIC_ARN=arn:aws:sns:us-east-1:123456789012:products.fifo
-```
-
-**Building the index the first time.** A slot streams changes from the moment it's created; it isn't a backfill tool. Build the initial index from the `products` table, then let the relay keep it current. The version check makes any overlap between the two harmless.
 
 ## Configure
 
@@ -507,7 +375,7 @@ The relay reads a TOML file (first argument, default `./relay.toml`), then envir
 SELECT id, reason, failed_at, envelope FROM outbox_dead_letter ORDER BY failed_at;
 ```
 
-To republish one after fixing the cause, insert a corrected row into `outbox` with a new `id`, then delete the dead letter. The relay refuses to start without the table or its `INSERT` grant. **Upgrading from M1:** run the `CREATE TABLE outbox_dead_letter` statement from [`sql/outbox.sql`](sql/outbox.sql), then the `GRANT`.
+To republish one after fixing the cause, insert a corrected row into `outbox` with a new `id`, then delete the dead letter. The relay refuses to start without the table or its `INSERT` grant. **Upgrading from 0.1:** run the `CREATE TABLE outbox_dead_letter` statement from [`sql/outbox.sql`](sql/outbox.sql), then the `GRANT`.
 
 ## Delivery semantics
 
@@ -522,24 +390,16 @@ To republish one after fixing the cause, insert a corrected row into `outbox` wi
 
 Exactly-once is not a goal. It is the consumer's job, made possible by `id`.
 
-## Upgrading from M2
-
-A single-database config needs no changes. What consumers and operators see:
-- **Events gain `source`**, the database they were committed in: a field in the envelope, a `source` message attribute on SQS and SNS, a `source` field on Redis Streams.
-- **FIFO `MessageGroupId` and `MessageDeduplicationId` gain a `<database>:` prefix.** An aggregate's last event before the upgrade and its first event after it land in different groups, so drain the queue before upgrading if that ordering matters. An event replayed across the upgrade is not deduplicated by the queue; consumers deduplicate on `id` anyway.
-- **Every metric gains a `source` label.** The shipped alerts and dashboard are updated, and there is a new `pg_outbox_source_up` gauge and `OutboxSourceDown` alert.
-- **A source error no longer exits the process.** A database that is down or a missing slot restarts that source's pipeline after a backoff, and `pg_outbox_source_up` shows it.
-
 ## Benchmarks
 
 Against a Python polling relay (`SELECT … FOR UPDATE SKIP LOCKED`, then `SendMessageBatch` and `DELETE`), on the same Postgres and local SQS, median of 3 runs:
 
-| | pg-outbox-relay | Python polling relay |
-|---|--:|--:|
-| Throughput, 1,000 aggregates | **4,820 events/s** | 2,250 events/s |
-| Throughput, one hot aggregate | 1,660 events/s | **2,860 events/s** |
-| Latency at 200 events/s, p50 / p99 | **12 / 23 ms** | 51 / 102 ms |
-| Peak memory | **17 MB** | 70 MB |
+| | pg-outbox-relay | Python polling relay | pg-outbox-relay vs. polling |
+|---|--:|--:|--:|
+| Throughput, 1,000 aggregates | **4,820 events/s** | 2,250 events/s | **114% more** |
+| Throughput, one hot aggregate | 1,660 events/s | **2,860 events/s** | 42% less |
+| Latency at 200 events/s, p50 / p99 | **12 / 23 ms** | 51 / 102 ms | **76% / 77% lower** |
+| Peak memory | **17.3 MB** | 69.8 MB | **75% less** |
 
 A single hot aggregate is the relay's weak case. It sends one event per request for an aggregate, so a failed entry can never reorder it. [docs/benchmarks.md](docs/benchmarks.md) has the method, the caveats, and how to reproduce it with `cargo bench --bench relay`.
 
@@ -550,7 +410,7 @@ Prerequisites: Rust 1.94.1 or newer (the AWS SDK sets that minimum) and Docker f
 ```bash
 cargo test                          # unit, core and architecture tests: fast, no Docker
 cargo test -- --ignored             # end to end (SQS, SNS, Redis, dead letters) and the crash tests: the relay binary under SIGTERM and SIGKILL
-cargo bench --bench relay           # the M4 benchmarks: Docker and bench/.venv (docs/benchmarks.md)
+cargo bench --bench relay           # benchmarks against a Python polling relay: Docker and bench/.venv (docs/benchmarks.md)
 cargo fmt --check && cargo clippy --all-targets -- -D warnings
 cargo run -- relay.toml             # against your own Postgres and broker
 ```
@@ -566,7 +426,7 @@ src/
 ├── config.rs    TOML + RELAY__ env → every layer's settings
 └── main.rs      composition root
 tests/           relay.rs (core, with fakes), architecture.rs; Docker: e2e_*.rs, crash.rs, common/
-benches/         relay.rs: the M4 benchmark
+benches/         relay.rs: the benchmark against the polling relay
 bench/           polling_relay.py: the Python relay it compares against
 sql/             outbox table + publication, replication slot
 deploy/          demo configs: Postgres init, ElasticMQ, Prometheus + alerts, Grafana
@@ -580,17 +440,6 @@ docs/            architecture.md, benchmarks.md, adr/, spec.md (the original des
 - the known limits and their upgrade paths.
 
 Decisions are recorded in [docs/adr/](docs/adr/), for example why the replication client is `pgwire-replication`.
-
-## Roadmap
-
-| Milestone | Scope | Status |
-|---|---|---|
-| **M1** | Replication source, SQS FIFO sink, LSN checkpointing, metrics and health, Docker Compose demo, end-to-end test | ✅ done |
-| **M2** | SNS and Redis Streams sinks, `outbox_dead_letter` table, graceful drain on SIGTERM, TLS for SQL connections, process-kill crash test in CI | ✅ done |
-| **M3** | Multi-source: one process relays N databases (one slot per tenant database) | ✅ done |
-| **M4** | Benchmarks (events/s, p99 latency, memory) against a Python polling relay | ✅ done |
-
-Non-goals: exactly-once end to end, general-purpose CDC for arbitrary tables (use Debezium), and schema registries or routing DSLs.
 
 ## License
 
