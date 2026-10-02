@@ -103,7 +103,7 @@ The core may use two facades, much like `log`: `tracing` for logs and `metrics` 
 - **A missing slot fails that source**, with a hint to run `sql/slot.sql`, and it is retried with the backoff. The relay never creates slots: a recreated slot silently skips everything committed before it existed.
 - **A missing dead-letter table or grant fails that source** as it starts, once the database is reachable, instead of stalling at the first rejected event, and it is retried with the backoff.
 - **Broker errors never crash.** They are retried forever with backoff (100 ms up to 30 s), during which `sink_ready` is false.
-- **Shutdown drains.** On SIGTERM/SIGINT every source stops reading its WAL at a transaction boundary, its core publishes everything already read, its final ack reaches Postgres, and the process exits 0: the next start replays nothing. A source waiting for its slot, or in a restart backoff, stops at once. During a broker outage the drain waits; a second signal (or the orchestrator's SIGKILL) ends it, and unacknowledged events replay.
+- **Shutdown drains.** On SIGTERM/SIGINT every source stops reading its WAL at a transaction boundary, its core publishes everything already read, its final ack reaches Postgres, and the process exits 0: the next start replays nothing. If a source's final ack cannot reach Postgres, the other sources still finish their drains, and the process then exits 1. A source waiting for its slot, or in a restart backoff, stops at once. During a broker outage the drain waits; a second signal (or the orchestrator's SIGKILL) ends it, and unacknowledged events replay.
 
 ## Tests
 
