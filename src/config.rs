@@ -196,6 +196,19 @@ mod tests {
     }
 
     #[test]
+    fn an_empty_database_list_in_the_environment_relays_the_dsn_alone() {
+        // Templated deployments often set the variable, empty, for a single database.
+        let config = Config::from(
+            "relay.example.toml",
+            env(&[("RELAY__SOURCE__DATABASES", "")]),
+        )
+        .unwrap();
+        let sources = config.source.sources().unwrap();
+        assert_eq!(sources.len(), 1);
+        assert_eq!(sources[0].database().unwrap(), "app");
+    }
+
+    #[test]
     fn rejects_a_batch_size_of_zero() {
         let result = Config::from(
             "relay.example.toml",
