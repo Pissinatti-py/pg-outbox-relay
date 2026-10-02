@@ -234,7 +234,7 @@ Each SQS message body is the envelope shown in the [Quickstart](#quickstart-5-mi
 
 ### 4. Several databases (one per tenant)
 
-One relay can serve every tenant database on a Postgres server, each through its own pipeline. List the databases, and use `{database}` in the DSN and in the slot name, since slot names are unique across the whole server:
+One relay can serve every tenant database on a Postgres server, each through its own pipeline. List the databases, and use `{database}` in the DSN and in the slot name, since slot names are unique across the whole server. Slot names allow only lowercase letters, digits and underscores, so database names must too:
 
 ```bash
 RELAY__SOURCE__DSN=postgres://relay:...@db:5432/{database}?sslmode=verify-full
@@ -243,15 +243,15 @@ RELAY__SOURCE__PUBLICATION=outbox_pub
 RELAY__SOURCE__DATABASES=acme,globex,initech
 ```
 
-In each tenant database, run `sql/outbox.sql`, grant the relay INSERT on `outbox_dead_letter`, and create the database's slot outside a transaction:
+In each tenant database, run `sql/outbox.sql`, grant the relay INSERT on `outbox_dead_letter`, and create the database's slot outside a transaction. Create it before the application writes events there, since nothing keeps the events committed before the slot exists:
 
 ```sql
 SELECT pg_create_logical_replication_slot('outbox_' || current_database(), 'pgoutput');
 ```
 
-- **Tenants are isolated.** A database that is down, or whose slot is missing, is retried with a backoff (1 s, growing to 60 s) while every other tenant keeps streaming. `pg_outbox_source_up{source}` and the `OutboxSourceDown` alert show it.
+- **Tenants are isolated.** A database that is unreachable is retried every 5 s, and a source that fails, for example on a missing slot, restarts after a backoff that grows to 60 s, while every other tenant keeps streaming. `pg_outbox_source_up{source}` and the `OutboxSourceDown` alert show it.
 - **Events carry their database** in `source`, and FIFO group and deduplication ids start with it: two tenants' `policy:42` never share a group, and a FIFO queue never drops one tenant's event as a duplicate of another's. An `id` is unique only within its database, so unless your ids are random UUIDs, consumers deduplicate on `source` and `id`.
-- **Adding a tenant** means adding it to the list and restarting the relay. The restart drains, so nothing replays.
+- **Adding a tenant** means adding it to the list and restarting the relay. The restart drains, so nothing replays. **Removing one** means taking it off the list, restarting, then dropping its slot (`SELECT pg_drop_replication_slot('outbox_<name>')`): a slot nobody reads keeps WAL for the whole server, and once its source is off the list, no alert sees it.
 - **Postgres limits:** raise `max_replication_slots` and `max_wal_senders` above the number of tenants (both default to 10), with a few spare for a standby's connection attempts. Every slot's connection reads the server's whole WAL, so about 30 tenants per server is comfortable.
 
 ## Examples
@@ -491,7 +491,7 @@ The relay reads a TOML file (first argument, default `./relay.toml`), then envir
 **Alerts:** [`deploy/prometheus/alerts.yml`](deploy/prometheus/alerts.yml) ships five rules, each per source where it applies:
 - `OutboxSlotLagHigh`;
 - `OutboxRelayDown`, because while the relay is down its lag metric disappears but the slot keeps growing;
-- `OutboxSourceDown`, when no relay streams a source (its database is down or its slot is missing);
+- `OutboxSourceDown`, when no relay streams a source (its database is down, its slot is missing, or its pipeline keeps failing);
 - `OutboxPublishStalled`;
 - `OutboxPoisonEvents`.
 

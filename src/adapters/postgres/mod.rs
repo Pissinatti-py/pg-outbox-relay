@@ -221,7 +221,7 @@ fn sqlstate(error: &PgWireError) -> Option<&str> {
 
 /// Forwards events to the relay and its acks to Postgres. On `stop`, it stops reading, lets
 /// the core publish what it was sent, and reports the final ack.
-/// Any stream error ends the process: Postgres replays everything unacked on restart.
+/// Any stream error ends this source's pipeline: Postgres replays everything unacked when it restarts.
 async fn stream(
     mut client: ReplicationClient,
     first: ReplicationEvent,
