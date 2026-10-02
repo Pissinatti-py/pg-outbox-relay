@@ -8,7 +8,7 @@
 - **Ordered per aggregate:** events of the same `aggregate_type` + `aggregate_id` arrive in commit order.
 - **Idempotent consumers made easy:** every event carries a stable `id` to deduplicate on.
 
-> **Status: milestone 3.** One relay serves many tenant databases (one slot each), publishing to SQS, SNS or Redis Streams. Benchmarks come next; see the [Roadmap](#roadmap).
+> **Status: milestone 4.** One relay serves many tenant databases (one slot each), publishing to SQS, SNS or Redis Streams. [Benchmarks](#benchmarks) compare it with a Python polling relay.
 
 ---
 
@@ -23,8 +23,9 @@
 7. [Operate](#operate)
 8. [Delivery semantics](#delivery-semantics)
 9. [Upgrading from M2](#upgrading-from-m2)
-10. [Develop](#develop)
-11. [Roadmap](#roadmap)
+10. [Benchmarks](#benchmarks)
+11. [Develop](#develop)
+12. [Roadmap](#roadmap)
 
 ---
 
@@ -529,6 +530,19 @@ A single-database config needs no changes. What consumers and operators see:
 - **Every metric gains a `source` label.** The shipped alerts and dashboard are updated, and there is a new `pg_outbox_source_up` gauge and `OutboxSourceDown` alert.
 - **A source error no longer exits the process.** A database that is down or a missing slot restarts that source's pipeline after a backoff, and `pg_outbox_source_up` shows it.
 
+## Benchmarks
+
+Against a Python polling relay (`SELECT … FOR UPDATE SKIP LOCKED`, then `SendMessageBatch` and `DELETE`), on the same Postgres and local SQS, median of 3 runs:
+
+| | pg-outbox-relay | Python polling relay |
+|---|--:|--:|
+| Throughput, 1,000 aggregates | **4,820 events/s** | 2,250 events/s |
+| Throughput, one hot aggregate | 1,660 events/s | **2,860 events/s** |
+| Latency at 200 events/s, p50 / p99 | **12 / 23 ms** | 51 / 102 ms |
+| Peak memory | **17 MB** | 70 MB |
+
+A single hot aggregate is the relay's weak case. It sends one event per request for an aggregate, so a failed entry can never reorder it. [docs/benchmarks.md](docs/benchmarks.md) has the method, the caveats, and how to reproduce it with `cargo bench --bench relay`.
+
 ## Develop
 
 Prerequisites: Rust 1.94.1 or newer (the AWS SDK sets that minimum) and Docker for the end-to-end test.
@@ -536,6 +550,7 @@ Prerequisites: Rust 1.94.1 or newer (the AWS SDK sets that minimum) and Docker f
 ```bash
 cargo test                          # unit, core and architecture tests: fast, no Docker
 cargo test -- --ignored             # end to end (SQS, SNS, Redis, dead letters) and the crash tests: the relay binary under SIGTERM and SIGKILL
+cargo bench --bench relay           # the M4 benchmarks: Docker and bench/.venv (docs/benchmarks.md)
 cargo fmt --check && cargo clippy --all-targets -- -D warnings
 cargo run -- relay.toml             # against your own Postgres and broker
 ```
@@ -551,9 +566,11 @@ src/
 ├── config.rs    TOML + RELAY__ env → every layer's settings
 └── main.rs      composition root
 tests/           relay.rs (core, with fakes), architecture.rs; Docker: e2e_*.rs, crash.rs, common/
+benches/         relay.rs: the M4 benchmark
+bench/           polling_relay.py: the Python relay it compares against
 sql/             outbox table + publication, replication slot
 deploy/          demo configs: Postgres init, ElasticMQ, Prometheus + alerts, Grafana
-docs/            architecture.md, adr/, spec.md (the original design)
+docs/            architecture.md, benchmarks.md, adr/, spec.md (the original design)
 ```
 
 [docs/architecture.md](docs/architecture.md) covers:
@@ -571,7 +588,7 @@ Decisions are recorded in [docs/adr/](docs/adr/), for example why the replicatio
 | **M1** | Replication source, SQS FIFO sink, LSN checkpointing, metrics and health, Docker Compose demo, end-to-end test | ✅ done |
 | **M2** | SNS and Redis Streams sinks, `outbox_dead_letter` table, graceful drain on SIGTERM, TLS for SQL connections, process-kill crash test in CI | ✅ done |
 | **M3** | Multi-source: one process relays N databases (one slot per tenant database) | ✅ done |
-| **M4** | Benchmarks (events/s, p99 latency, memory) against a Python polling relay | next |
+| **M4** | Benchmarks (events/s, p99 latency, memory) against a Python polling relay | ✅ done |
 
 Non-goals: exactly-once end to end, general-purpose CDC for arbitrary tables (use Debezium), and schema registries or routing DSLs.
 
