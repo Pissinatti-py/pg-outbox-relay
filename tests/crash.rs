@@ -4,72 +4,10 @@
 
 mod common;
 
-use std::process::{Child, Command, ExitStatus};
 use std::time::Duration;
 
-use tokio::time::{Instant, sleep};
-
-/// A relay process configured through the environment alone, like in a container.
-struct RelayProcess(Child);
-
-impl RelayProcess {
-    fn start(pg: &common::Pg, queue_url: &str, sqs_endpoint: &str) -> anyhow::Result<Self> {
-        let source = pg.config();
-        Ok(Self(
-            Command::new(env!("CARGO_BIN_EXE_pg-outbox-relay"))
-                .arg("no-such-file.toml") // the environment alone configures it
-                .env("RELAY__SOURCE__DSN", &source.dsn)
-                .env("RELAY__SOURCE__SLOT", &source.slot)
-                .env("RELAY__SOURCE__PUBLICATION", &source.publication)
-                .env("RELAY__SINK__KIND", "sqs")
-                .env("RELAY__SINK__QUEUE_URL", queue_url)
-                .env("RELAY__SERVER__LISTEN", "127.0.0.1:0") // several relays at once
-                .env("AWS_ENDPOINT_URL", sqs_endpoint)
-                .env("AWS_REGION", "us-east-1")
-                .env("AWS_ACCESS_KEY_ID", "e2e")
-                .env("AWS_SECRET_ACCESS_KEY", "e2e")
-                .env("RUST_LOG", "warn")
-                .spawn()?,
-        ))
-    }
-
-    /// What a deploy sends.
-    fn terminate(&self) -> anyhow::Result<()> {
-        let sent = Command::new("kill")
-            .args(["-TERM", &self.0.id().to_string()])
-            .status()?;
-        anyhow::ensure!(sent.success(), "kill -TERM failed");
-        Ok(())
-    }
-
-    /// No chance to clean up.
-    fn kill(&mut self) -> anyhow::Result<()> {
-        self.0.kill()?;
-        self.0.wait()?;
-        Ok(())
-    }
-
-    /// The exit status, or `None` if it still runs after `within`.
-    async fn exited(&mut self, within: Duration) -> anyhow::Result<Option<ExitStatus>> {
-        let deadline = Instant::now() + within;
-        loop {
-            if let Some(status) = self.0.try_wait()? {
-                return Ok(Some(status));
-            }
-            if Instant::now() >= deadline {
-                return Ok(None);
-            }
-            sleep(Duration::from_millis(50)).await;
-        }
-    }
-}
-
-impl Drop for RelayProcess {
-    fn drop(&mut self) {
-        let _ = self.0.kill(); // no orphans when an assertion fails
-        let _ = self.0.wait();
-    }
-}
+use common::RelayProcess;
+use tokio::time::sleep;
 
 #[tokio::test]
 #[ignore = "needs Docker"]
@@ -79,11 +17,11 @@ async fn sigterm_drains_so_the_next_start_publishes_no_duplicates() -> anyhow::R
     let sqs = aws_sdk_sqs::Client::new(&common::aws(&endpoint).await);
     let queue_url = common::create_queue(&sqs, "events").await?; // standard: duplicates stay visible
 
-    let mut active = RelayProcess::start(&pg, &queue_url, &endpoint)?;
+    let mut active = RelayProcess::start(&pg.config(), &queue_url, &endpoint)?;
     pg.wait_until_streaming().await?;
 
     // A standby waiting for the slot stops at once.
-    let mut standby = RelayProcess::start(&pg, &queue_url, &endpoint)?;
+    let mut standby = RelayProcess::start(&pg.config(), &queue_url, &endpoint)?;
     sleep(Duration::from_secs(1)).await;
     standby.terminate()?;
     let status = standby.exited(Duration::from_secs(3)).await?;
@@ -109,7 +47,7 @@ async fn sigterm_drains_so_the_next_start_publishes_no_duplicates() -> anyhow::R
     );
 
     // The next instance starts exactly where the final ack left off.
-    let _next = RelayProcess::start(&pg, &queue_url, &endpoint)?;
+    let _next = RelayProcess::start(&pg.config(), &queue_url, &endpoint)?;
     common::receive(
         &sqs,
         &queue_url,
@@ -139,7 +77,7 @@ async fn a_second_signal_stops_a_drain_stuck_on_a_dead_broker() -> anyhow::Resul
     let (elasticmq, endpoint) = common::elasticmq().await?;
     let sqs = aws_sdk_sqs::Client::new(&common::aws(&endpoint).await);
     let queue_url = common::create_queue(&sqs, "events").await?;
-    let mut relay = RelayProcess::start(&pg, &queue_url, &endpoint)?;
+    let mut relay = RelayProcess::start(&pg.config(), &queue_url, &endpoint)?;
     pg.wait_until_streaming().await?;
 
     elasticmq.pause().await?; // the broker hangs
@@ -156,7 +94,7 @@ async fn a_second_signal_stops_a_drain_stuck_on_a_dead_broker() -> anyhow::Resul
 
     // Nothing is lost: once the broker is back, the next instance publishes it all.
     elasticmq.unpause().await?;
-    let _next = RelayProcess::start(&pg, &queue_url, &endpoint)?;
+    let _next = RelayProcess::start(&pg.config(), &queue_url, &endpoint)?;
     let inserted = pg.ids().await?;
     let mut received = Vec::new();
     common::receive(
@@ -183,7 +121,7 @@ async fn sigkill_mid_stream_loses_nothing() -> anyhow::Result<()> {
     // Hard kills with writes in flight. 50-row transactions over 50 aggregates span
     // several batches: the case M1 could lose.
     for round in 0..2 {
-        let mut relay = RelayProcess::start(&pg, &queue_url, &endpoint)?;
+        let mut relay = RelayProcess::start(&pg.config(), &queue_url, &endpoint)?;
         pg.insert(round * 500, 500, 50, 50).await?;
         let seen = received.len();
         common::receive(
@@ -198,7 +136,7 @@ async fn sigkill_mid_stream_loses_nothing() -> anyhow::Result<()> {
     }
 
     // The hardest case: the relay has read whole transactions it cannot publish, then dies.
-    let mut relay = RelayProcess::start(&pg, &queue_url, &endpoint)?;
+    let mut relay = RelayProcess::start(&pg.config(), &queue_url, &endpoint)?;
     let so_far = pg.ids().await?;
     common::receive(
         &sqs,
@@ -215,7 +153,7 @@ async fn sigkill_mid_stream_loses_nothing() -> anyhow::Result<()> {
     relay.kill()?;
     elasticmq.unpause().await?;
 
-    let _relay = RelayProcess::start(&pg, &queue_url, &endpoint)?;
+    let _relay = RelayProcess::start(&pg.config(), &queue_url, &endpoint)?;
     let inserted = pg.ids().await?;
     common::receive(
         &sqs,

@@ -35,6 +35,7 @@ mod tests {
     fn event(id: &str, aggregate_id: &str) -> OutboxEvent {
         OutboxEvent {
             id: id.into(),
+            source: "acme".into(),
             aggregate_type: "policy".into(),
             aggregate_id: aggregate_id.into(),
             event_type: "policy.approved".into(),

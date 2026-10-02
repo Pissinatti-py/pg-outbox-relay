@@ -9,7 +9,7 @@ groups:
         labels:
           severity: page
         annotations:
-          summary: "Replication slot holds {{ $value | humanize1024 }}B of WAL"
+          summary: "Replication slot of {{ $labels.source }} holds {{ $value | humanize1024 }}B of WAL"
           description: >-
             The relay is behind or stuck (check pg_outbox_publish_errors_total).
             Postgres keeps this WAL until the relay acknowledges it.
@@ -23,20 +23,30 @@ groups:
         annotations:
           summary: "pg-outbox-relay is down; the replication slot is growing"
 
-      - alert: OutboxPublishStalled
-        expr: >-
-          sum(increase(pg_outbox_publish_errors_total{kind="retryable"}[5m])) > 0
-          and sum(increase(pg_outbox_events_published_total[5m])) == 0
+      - alert: OutboxSourceDown
+        # Two replicas share the slots: a source is fine while either of them streams it.
+        expr: sum by (source) (pg_outbox_source_up) == 0
         for: 5m
         labels:
           severity: page
         annotations:
-          summary: "The broker rejects every publish; events are waiting in the WAL"
+          summary: "No relay streams {{ $labels.source }}"
+          description: "Its database is down or its slot is missing (see the relay's ERROR logs). Its slot keeps WAL meanwhile."
+
+      - alert: OutboxPublishStalled
+        expr: >-
+          sum by (source) (increase(pg_outbox_publish_errors_total{kind="retryable"}[5m])) > 0
+          and sum by (source) (increase(pg_outbox_events_published_total[5m])) == 0
+        for: 5m
+        labels:
+          severity: page
+        annotations:
+          summary: "The broker rejects every publish of {{ $labels.source }}; its events are waiting in the WAL"
 
       - alert: OutboxPoisonEvents
         expr: increase(pg_outbox_dead_letters_total[15m]) > 0
         labels:
           severity: ticket
         annotations:
-          summary: "Events were rejected permanently and skipped"
+          summary: "Events of {{ $labels.source }} were rejected permanently and skipped"
           description: "Their envelopes and the broker's reasons are in the outbox_dead_letter table."

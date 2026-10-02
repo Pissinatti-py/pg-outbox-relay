@@ -4,14 +4,17 @@ use std::process::ExitCode;
 use std::sync::Arc;
 
 use pg_outbox_relay::adapters::http;
-use pg_outbox_relay::adapters::postgres::{PgDeadLetters, PgSource};
+use pg_outbox_relay::adapters::postgres::{PgConfig, PgDeadLetters, PgSource};
 use pg_outbox_relay::adapters::redis::RedisSink;
 use pg_outbox_relay::adapters::sns::SnsSink;
 use pg_outbox_relay::adapters::sqs::SqsSink;
+use pg_outbox_relay::app::relay::{Batching, Retry};
 use pg_outbox_relay::app::{Health, relay};
 use pg_outbox_relay::config::{Config, SinkConfig};
+use pg_outbox_relay::ports::EventSink;
 use tokio::signal::unix::{SignalKind, signal};
 use tokio::sync::watch;
+use tokio::task::JoinSet;
 use tracing_subscriber::EnvFilter;
 
 #[tokio::main]
@@ -39,27 +42,26 @@ async fn run() -> anyhow::Result<()> {
         .nth(1)
         .unwrap_or_else(|| "relay.toml".into());
     let config = Config::load(&path)?;
+    let sources = config.source.sources()?;
     let metrics = http::install_metrics()?;
-    let health = Arc::new(Health::default());
+    let healths: Vec<Arc<Health>> = sources.iter().map(|_| Arc::default()).collect();
     let (stop, stopped) = watch::channel(false);
 
-    let dead_letters = PgDeadLetters::new(&config.source)?;
-    let source = PgSource::new(config.source, health.clone(), stopped);
     let relay = async {
-        // One arm per sink: relay::run is compiled for each concrete sink, with no trait objects.
-        let (batching, retry, health) = (config.batching, config.retry, health.clone());
+        let (healths, batching, retry) = (healths.clone(), config.batching, config.retry);
+        // One arm per sink: relay_all is compiled for each concrete sink, with no trait objects.
         match config.sink {
             SinkConfig::Sqs(sqs) => {
                 let sink = SqsSink::connect(sqs).await?;
-                relay::run(source, sink, dead_letters, batching, retry, health).await
+                relay_all(sink, sources, healths, batching, retry, stopped).await
             }
             SinkConfig::Sns(sns) => {
                 let sink = SnsSink::connect(sns).await?;
-                relay::run(source, sink, dead_letters, batching, retry, health).await
+                relay_all(sink, sources, healths, batching, retry, stopped).await
             }
             SinkConfig::Redis(redis) => {
                 let sink = RedisSink::connect(redis).await?;
-                relay::run(source, sink, dead_letters, batching, retry, health).await
+                relay_all(sink, sources, healths, batching, retry, stopped).await
             }
         }
     };
@@ -69,7 +71,7 @@ async fn run() -> anyhow::Result<()> {
     // everything unacknowledged on the next start.
     tokio::select! {
         result = &mut relay => result,
-        result = http::serve(config.server.listen, metrics, health.clone()) => result,
+        result = http::serve(config.server.listen, metrics, healths.clone()) => result,
         signal = shutdown_signal() => {
             tracing::info!("{} received, draining: publishing what was read, then sending a final ack", signal?);
             stop.send_replace(true);
@@ -85,6 +87,51 @@ async fn run() -> anyhow::Result<()> {
             }
         }
     }
+}
+
+/// Relays every source until the relay stops, one supervised pipeline each, all publishing
+/// through clones of `sink`: a failing source restarts alone and the others keep going.
+async fn relay_all<K: EventSink + Clone>(
+    sink: K,
+    sources: Vec<PgConfig>,
+    healths: Vec<Arc<Health>>,
+    batching: Batching,
+    retry: Retry,
+    stopped: watch::Receiver<bool>,
+) -> anyhow::Result<()> {
+    let mut pipelines = JoinSet::new();
+    for (config, health) in sources.into_iter().zip(healths) {
+        let name = config.database()?;
+        let (sink, batching, retry, stopped) = (
+            sink.clone(),
+            batching.clone(),
+            retry.clone(),
+            stopped.clone(),
+        );
+        pipelines.spawn(async move {
+            relay::supervise(&name, stopped.clone(), || {
+                // Each attempt starts fresh: the source owns the replication connection.
+                let source = PgSource::new(config.clone(), health.clone(), stopped.clone());
+                let dead_letters = PgDeadLetters::new(&config);
+                let (name, sink, batching, retry, health) = (
+                    name.clone(),
+                    sink.clone(),
+                    batching.clone(),
+                    retry.clone(),
+                    health.clone(),
+                );
+                async move {
+                    relay::run(&name, source, sink, dead_letters?, batching, retry, health).await
+                }
+            })
+            .await;
+        });
+    }
+    // Pipelines end only when the relay stops. A panic is a bug: crash, and let the orchestrator restart.
+    while let Some(ended) = pipelines.join_next().await {
+        ended?;
+    }
+    Ok(())
 }
 
 async fn shutdown_signal() -> anyhow::Result<&'static str> {

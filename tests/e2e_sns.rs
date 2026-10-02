@@ -75,6 +75,7 @@ async fn relays_outbox_inserts_through_a_fifo_topic() -> anyhow::Result<()> {
     let sink = SnsSink::with_client(sns, SnsConfig { topic_arn }).await?;
     let dead_letters = PgDeadLetters::new(&config)?;
     let relay = tokio::spawn(relay::run(
+        "postgres",
         source,
         sink,
         dead_letters,

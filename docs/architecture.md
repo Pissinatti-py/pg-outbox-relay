@@ -19,6 +19,7 @@ For what the relay is and how to run it, see the [README](../README.md). The ori
             │             DeadLetterStore                     │
             ├─────────────────────────────────────────────────┤
             │  app/       relay::run: the pipeline use case   │
+            │             relay::supervise: one per source    │
             ├─────────────────────────────────────────────────┤
             │  domain/    events, envelope, checkpoint,       │
             │             batching rule, backoff (pure)       │
@@ -50,24 +51,24 @@ The core may use two facades, much like `log`: `tracing` for logs and `metrics` 
 | `src/domain/batch.rs` | `take_batch`: at most one event per aggregate per batch | — |
 | `src/domain/backoff.rs` | Exponential backoff with full jitter (pure: jitter is an argument) | — |
 | `src/ports.rs` | `EventSource`, `EventSink`, `DeadLetterStore`, `PublishError` | domain, tokio channels |
-| `src/app/relay.rs` | `relay::run`: channel → buffer → batch → publish/retry/dead-letter → checkpoint → ack | domain, ports |
-| `src/app/mod.rs` | `Health`: readiness flags behind `/readyz` | — |
+| `src/app/relay.rs` | `relay::run`: channel → buffer → batch → publish/retry/dead-letter → checkpoint → ack; `relay::supervise`: restarts a failed source's pipeline | domain, ports |
+| `src/app/mod.rs` | `Health`: readiness flags behind `/readyz`; `stopped`: resolves when the relay is asked to stop | — |
 | `src/adapters/postgres/mod.rs` | `PgSource`: connect/retry, the replication stream, acks, the slot-lag poller, DSN parsing, SQL connections over the same TLS | pgwire-replication, tokio-postgres |
 | `src/adapters/postgres/pgoutput.rs` | Decodes pgoutput `Relation` and `Insert`; maps a row to an `OutboxEvent` | domain |
 | `src/adapters/postgres/dead_letter.rs` | `PgDeadLetters`: stores rejected events in `outbox_dead_letter`; the startup check | tokio-postgres |
 | `src/adapters/sqs.rs` | `SqsSink`: envelope → `SendMessageBatch`, call splitting, error classification (shared with SNS) | aws-sdk-sqs |
 | `src/adapters/sns.rs` | `SnsSink`: envelope → `PublishBatch`, reusing the SQS splitting, id mapping and classification | aws-sdk-sns |
-| `src/adapters/redis.rs` | `RedisSink`: `XADD` of `id`, `event_type`, `envelope` to one stream per aggregate type | redis |
+| `src/adapters/redis.rs` | `RedisSink`: `XADD` of `id`, `source`, `event_type`, `envelope` to one stream per aggregate type | redis |
 | `src/adapters/http.rs` | `/metrics`, `/healthz`, `/readyz` | axum, metrics-exporter-prometheus |
 | `src/config.rs` | TOML file + `RELAY__…` env overrides → each layer's own settings struct | config |
-| `src/main.rs` | Wires everything together; logging; signals | everything |
+| `src/main.rs` | Wires everything together: one supervised pipeline per source (`relay_all`); logging; signals | everything |
 
 ## The life of one event
 
 1. **The application commits.** A transaction inserts a row into `outbox`. Postgres writes it to the WAL, and the `outbox_pub` publication makes it visible to logical decoding.
 2. **`PgSource` receives the transaction** (`adapters/postgres/mod.rs`). `pgwire-replication` yields `Begin`, then raw pgoutput bytes, then `Commit`.
    - `pgoutput::Decoder` remembers column names from the `Relation` message and decodes each `Insert` into a row.
-   - Rows wait until `Commit`. They are then sent as `SourceMsg::Event`, tagged with the commit's `end_lsn` and commit time, followed by `SourceMsg::Progress(end_lsn)`.
+   - Rows wait until `Commit`. They are then sent as `SourceMsg::Event`, tagged with their database (`source`), the commit's `end_lsn` and commit time, followed by `SourceMsg::Progress(end_lsn)`.
    - A keepalive between transactions becomes `Progress(wal_end)`.
 3. **A bounded channel** (1024 messages) carries them to the core. When it is full, `PgSource` waits. The replication client keeps sending status updates meanwhile, so Postgres does not time the connection out.
 4. **The core buffers the event** (`app/relay.rs`). `checkpoint.track(lsn)` records it as unconfirmed. A flush happens when the buffer holds `max_events` events or when the oldest one has waited `max_wait_ms`.
@@ -85,23 +86,24 @@ The core may use two facades, much like `log`: `tracing` for logs and `metrics` 
 | **At-least-once** | The checkpoint keeps a `BTreeMap<commit LSN, unconfirmed count>`. `safe_lsn` pops fully confirmed entries from the lowest LSN up, and only up to the last `Progress` the source sent, so a transaction split across batches is never acked early. It returns the last one popped, so the ack can never pass an unconfirmed event. A crash only loses unacked progress, which Postgres replays. | `domain/checkpoint.rs` | `checkpoint` unit tests; `a_crash_mid_batch_loses_nothing`; `a_transaction_split_across_batches_is_acked_only_once_complete`; e2e ack check |
 | **Idle slots advance** | With nothing pending, a `Progress` LSN (commit or keepalive) becomes the ack, the same as Postgres' own apply worker. Keepalives received mid-transaction are ignored, because their `wal_end` can sit before that transaction's commit. | `checkpoint.rs`, `postgres/mod.rs` | `idle_progress_advances_the_ack` |
 | **Per-aggregate order** | pgoutput delivers in commit order and the channel is FIFO. A batch holds at most one event per aggregate, and it finishes, retries included, before the next batch starts. So a partial failure cannot let a later event of an aggregate overtake an earlier one. | `domain/batch.rs`, `app/relay.rs` | `batch` unit tests; `retries_retryable_failures_without_reordering`; e2e order check |
-| **Idempotency key** | The outbox `id` becomes the SQS or SNS `MessageDeduplicationId` and an `id` message attribute. `MessageGroupId` is `aggregate_type:aggregate_id`, mapped to their character set deterministically. | `adapters/sqs.rs`, `adapters/sns.rs` | `sqs` and `sns` unit tests; e2e |
+| **Idempotency key** | The outbox `id` becomes the SQS or SNS `MessageDeduplicationId` and an `id` message attribute. `MessageGroupId` is `source:aggregate_type:aggregate_id`, mapped to their character set deterministically. | `adapters/sqs.rs`, `adapters/sns.rs` | `sqs` and `sns` unit tests; e2e |
 | **Backpressure** | The core stops reading when a batch is due, the channel fills up, and the source waits. | `app/relay.rs` | `a_stalled_sink_holds_the_source_back` |
+| **One source cannot stall another** | Each database runs its own pipeline (channel, checkpoint, batches, dead letters) in its own task, all sharing one sink. `relay::supervise` restarts a failed pipeline alone, after a backoff, and a stop ends its backoff at once. | `app/relay.rs` (`supervise`), `main.rs` (`relay_all`) | `a_failed_source_restarts_and_catches_up`; `stopping_during_a_restart_backoff_returns_at_once`; `one_failing_source_does_not_hold_back_another`; `e2e_tenants` |
 | **Clean stop without replays** | On SIGTERM the source stops reading between transactions and closes the channel. The core publishes what it was sent, and `relay::run` waits for the source to report the final ack. The source confirms the replication worker has sent it (`last_applied_lsn`) before closing the stream. | `postgres/mod.rs` (`stream`, `final_ack`), `app/relay.rs`, `main.rs` | `a_clean_stop_hands_the_final_ack_to_the_source`; `sigterm_drains_so_the_next_start_publishes_no_duplicates`; `a_second_signal_stops_a_drain_stuck_on_a_dead_broker` |
 | **No poison-pill stall** | Only rejected *content* is `Permanent`. Call-level failures and unknown entry errors are retried, so a stall is visible and loses nothing. A rejected event is stored before it is confirmed, so the ack never passes an event that is nowhere. | `adapters/sqs.rs` (`classify`), `app/relay.rs` (`dead_letter`) | `dead_letters_a_permanently_rejected_event_and_moves_on`; `a_rejected_event_is_not_acked_until_it_is_dead_lettered`; `classify` tests; `e2e_postgres` |
 
 ## Failure model
 
-- **Crash-only.** Any error in the stream ends the process with a JSON `ERROR` log, and the orchestrator restarts it. Postgres replays everything unacknowledged, so crashing is always safe, and there is no in-process recovery code to get wrong.
+- **Crash-only, per source.** Any error in a source's stream ends that source's pipeline with a JSON `ERROR` log, and `relay::supervise` starts it again after a backoff (1 s, growing to 60 s). Postgres replays everything that source had not acknowledged, exactly as after a process restart, so a restart is always safe, and the other sources keep streaming. The process itself exits only on a startup error, a signal or a panic.
 - **Connecting waits instead of crashing** in these cases:
   - the slot is held by another relay (`55006`): this instance is the HA standby;
   - the database is starting (`57P03`) or unreachable.
 
   Meanwhile `/readyz` returns 503.
-- **A missing slot fails fast**, with a hint to run `sql/slot.sql`. The relay never creates slots: a recreated slot silently skips everything committed before it existed.
-- **A missing dead-letter table or grant fails fast** at startup, once the database is reachable, instead of stalling at the first rejected event.
+- **A missing slot fails that source**, with a hint to run `sql/slot.sql`, and it is retried with the backoff. The relay never creates slots: a recreated slot silently skips everything committed before it existed.
+- **A missing dead-letter table or grant fails that source** as it starts, once the database is reachable, instead of stalling at the first rejected event, and it is retried with the backoff.
 - **Broker errors never crash.** They are retried forever with backoff (100 ms up to 30 s), during which `sink_ready` is false.
-- **Shutdown drains.** On SIGTERM/SIGINT the source stops reading the WAL at a transaction boundary, the core publishes everything already read, the final ack reaches Postgres, and the process exits 0: the next start replays nothing. A standby waiting for the slot exits at once. During a broker outage the drain waits; a second signal (or the orchestrator's SIGKILL) ends it, and unacknowledged events replay.
+- **Shutdown drains.** On SIGTERM/SIGINT every source stops reading its WAL at a transaction boundary, its core publishes everything already read, its final ack reaches Postgres, and the process exits 0: the next start replays nothing. A source waiting for its slot, or in a restart backoff, stops at once. During a broker outage the drain waits; a second signal (or the orchestrator's SIGKILL) ends it, and unacknowledged events replay.
 
 ## Tests
 
@@ -156,3 +158,5 @@ Each is marked in the code with a `ponytail:` comment naming the upgrade path.
 | One SQL connection per dead letter | Fine while dead letters are rare | Keep one connection open |
 | Redis: one `XADD` round trip per event | About 10 round trips per batch | Pipeline the batch if the M4 benchmarks ask for it |
 | A drain waits for the broker | An outage holds it until SIGKILL or a second signal (safe: unacked events replay) | A drain-timeout setting, if grace periods prove too short |
+| The database list is read at startup | Adding a tenant needs a restart (it drains, so nothing replays) | Discover slots by name prefix |
+| One replication connection per database | Each reads the server's whole WAL; about 30 per server is comfortable | Fewer databases per server, or a polling source |

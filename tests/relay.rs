@@ -188,6 +188,7 @@ fn events(count: u64, aggregates: u64) -> Vec<OutboxEvent> {
     (1..=count)
         .map(|n| OutboxEvent {
             id: format!("evt-{n}"),
+            source: "acme".into(),
             aggregate_type: "policy".into(),
             aggregate_id: (n % aggregates).to_string(),
             event_type: "policy.updated".into(),
@@ -235,6 +236,7 @@ async fn relay_with(
 ) -> anyhow::Result<()> {
     let health = Arc::new(Health::default());
     relay::run(
+        "fake",
         source,
         sink,
         dead_letters,
@@ -505,4 +507,62 @@ async fn a_clean_stop_hands_the_final_ack_to_the_source() {
     relay(source, FakeSink::default()).await.unwrap();
 
     assert_eq!(*probe.final_ack.lock().unwrap(), Some(Lsn(2_500)));
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_failed_source_restarts_and_catches_up() {
+    let events = events(20, 5);
+    let sink = FakeSink::default();
+    let (_stop, stopped) = watch::channel(false);
+    let attempts = AtomicUsize::new(0);
+
+    relay::supervise("acme", stopped, || {
+        let failing = attempts.fetch_add(1, Ordering::SeqCst) == 0;
+        let (source, sink) = (FakeSource::new(&wal(&events), Lsn(0)), sink.clone());
+        async move {
+            anyhow::ensure!(!failing, "database unreachable");
+            relay(source, sink).await
+        }
+    })
+    .await;
+
+    assert_eq!(attempts.load(Ordering::SeqCst), 2);
+    assert_eq!(ids(&sink.published()), ids(&events));
+}
+
+#[tokio::test(start_paused = true)]
+async fn stopping_during_a_restart_backoff_returns_at_once() {
+    let (stop, stopped) = watch::channel(false);
+    let supervised = tokio::spawn(relay::supervise("acme", stopped, || async {
+        anyhow::bail!("replication slot outbox_acme does not exist")
+    }));
+    tokio::time::sleep(Duration::from_secs(90)).await; // several failures: now in a long backoff
+    let stopped_at = tokio::time::Instant::now();
+    stop.send_replace(true);
+    supervised.await.unwrap();
+    assert_eq!(
+        stopped_at.elapsed(),
+        Duration::ZERO,
+        "waited out the backoff after the stop"
+    );
+}
+
+#[tokio::test(start_paused = true)]
+async fn one_failing_source_does_not_hold_back_another() {
+    let events = events(30, 3);
+    let sink = FakeSink::default();
+    let (stop, stopped) = watch::channel(false);
+    let broken = tokio::spawn(relay::supervise("initech", stopped.clone(), || async {
+        anyhow::bail!("replication slot outbox_initech does not exist")
+    }));
+    let (wal, healthy) = (wal(&events), sink.clone());
+    relay::supervise("acme", stopped, move || {
+        relay(FakeSource::new(&wal, Lsn(0)), healthy.clone())
+    })
+    .await;
+
+    assert_eq!(ids(&sink.published()), ids(&events));
+    assert!(!broken.is_finished(), "the broken source keeps retrying");
+    stop.send_replace(true);
+    broken.await.unwrap();
 }

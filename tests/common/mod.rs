@@ -2,6 +2,7 @@
 #![allow(dead_code)] // each test binary uses a different part
 
 use std::collections::{HashMap, HashSet};
+use std::process::{Child, Command, ExitStatus};
 use std::time::Duration;
 
 use aws_config::{BehaviorVersion, Region, SdkConfig};
@@ -75,11 +76,11 @@ impl Pg {
             ),
             slot: SLOT.into(),
             publication: "outbox_pub".into(),
+            databases: Vec::new(),
         }
     }
 
-    /// Inserts events `first..first + count` (payload `{"n": n}`) over `aggregates`
-    /// aggregates, `per_tx` rows per transaction.
+    /// Inserts events into the default database; see [`insert`].
     pub async fn insert(
         &self,
         first: usize,
@@ -87,30 +88,44 @@ impl Pg {
         aggregates: usize,
         per_tx: usize,
     ) -> anyhow::Result<()> {
-        let numbers: Vec<usize> = (first..first + count).collect();
-        for chunk in numbers.chunks(per_tx) {
-            let rows: Vec<String> = chunk
-                .iter()
-                .map(|n| {
-                    format!(
-                        "(gen_random_uuid(), 'policy', '{}', 'policy.updated', '{{\"n\": {n}}}', '{{\"tenant\": \"acme\"}}')",
-                        n % aggregates
-                    )
-                })
-                .collect();
-            self.db
-                .batch_execute(&format!(
-                    "INSERT INTO outbox (id, aggregate_type, aggregate_id, event_type, payload, headers) VALUES {}",
-                    rows.join(", ")
-                ))
-                .await?;
-        }
-        Ok(())
+        insert(&self.db, first, count, aggregates, per_tx).await
     }
 
     pub async fn ids(&self) -> anyhow::Result<HashSet<String>> {
-        let rows = self.db.query("SELECT id::text FROM outbox", &[]).await?;
-        Ok(rows.iter().map(|row| row.get(0)).collect())
+        ids_in(&self.db).await
+    }
+
+    /// Creates a tenant database set up like the default one, with its slot `outbox_<name>`
+    /// unless `with_slot` is false, and returns a superuser connection to it.
+    pub async fn tenant(
+        &self,
+        name: &str,
+        with_slot: bool,
+    ) -> anyhow::Result<tokio_postgres::Client> {
+        self.db
+            .batch_execute(&format!("CREATE DATABASE {name}"))
+            .await?;
+        let (db, connection) = tokio_postgres::connect(
+            &format!(
+                "host=127.0.0.1 port={} user=postgres password=postgres dbname={name}",
+                self.port
+            ),
+            NoTls,
+        )
+        .await?;
+        tokio::spawn(connection);
+        db.batch_execute(include_str!("../../sql/outbox.sql"))
+            .await?;
+        db.batch_execute("GRANT INSERT ON outbox_dead_letter TO relay")
+            .await?;
+        if with_slot {
+            // Its own statement: a slot cannot be created in a transaction that has written.
+            db.batch_execute(&format!(
+                "SELECT pg_create_logical_replication_slot('outbox_{name}', 'pgoutput')"
+            ))
+            .await?;
+        }
+        Ok(db)
     }
 
     /// Waits until the slot confirms everything written so far.
@@ -142,6 +157,41 @@ impl Pg {
         }
         Ok(())
     }
+}
+
+/// Inserts events `first..first + count` (payload `{"n": n}`) over `aggregates`
+/// aggregates, `per_tx` rows per transaction.
+pub async fn insert(
+    db: &tokio_postgres::Client,
+    first: usize,
+    count: usize,
+    aggregates: usize,
+    per_tx: usize,
+) -> anyhow::Result<()> {
+    let numbers: Vec<usize> = (first..first + count).collect();
+    for chunk in numbers.chunks(per_tx) {
+        let rows: Vec<String> = chunk
+            .iter()
+            .map(|n| {
+                format!(
+                    "(gen_random_uuid(), 'policy', '{}', 'policy.updated', '{{\"n\": {n}}}', '{{\"tenant\": \"acme\"}}')",
+                    n % aggregates
+                )
+            })
+            .collect();
+        db.batch_execute(&format!(
+            "INSERT INTO outbox (id, aggregate_type, aggregate_id, event_type, payload, headers) VALUES {}",
+            rows.join(", ")
+        ))
+        .await?;
+    }
+    Ok(())
+}
+
+/// Ids of every row in the database's outbox.
+pub async fn ids_in(db: &tokio_postgres::Client) -> anyhow::Result<HashSet<String>> {
+    let rows = db.query("SELECT id::text FROM outbox", &[]).await?;
+    Ok(rows.iter().map(|row| row.get(0)).collect())
 }
 
 /// ElasticMQ, a local SQS, and its endpoint URL.
@@ -235,7 +285,7 @@ pub fn ids(received: &[Received]) -> HashSet<String> {
 pub fn assert_ordered_per_aggregate(received: &[Received]) {
     let mut last = HashMap::new();
     for r in received {
-        let aggregate = r.envelope["aggregate_id"].as_str().unwrap().to_owned();
+        let aggregate = format!("{}:{}", r.envelope["source"], r.envelope["aggregate_id"]);
         let n = r.envelope["payload"]["n"].as_u64().unwrap();
         if let Some(previous) = last.insert(aggregate.clone(), n) {
             assert!(
@@ -243,5 +293,70 @@ pub fn assert_ordered_per_aggregate(received: &[Received]) {
                 "aggregate {aggregate}: {n} arrived after {previous}"
             );
         }
+    }
+}
+
+/// A relay process configured through the environment alone, like in a container.
+pub struct RelayProcess(Child);
+
+impl RelayProcess {
+    pub fn start(source: &PgConfig, queue_url: &str, sqs_endpoint: &str) -> anyhow::Result<Self> {
+        let mut command = Command::new(env!("CARGO_BIN_EXE_pg-outbox-relay"));
+        if !source.databases.is_empty() {
+            command.env("RELAY__SOURCE__DATABASES", source.databases.join(","));
+        }
+        Ok(Self(
+            command
+                .arg("no-such-file.toml") // the environment alone configures it
+                .env("RELAY__SOURCE__DSN", &source.dsn)
+                .env("RELAY__SOURCE__SLOT", &source.slot)
+                .env("RELAY__SOURCE__PUBLICATION", &source.publication)
+                .env("RELAY__SINK__KIND", "sqs")
+                .env("RELAY__SINK__QUEUE_URL", queue_url)
+                .env("RELAY__SERVER__LISTEN", "127.0.0.1:0") // several relays at once
+                .env("AWS_ENDPOINT_URL", sqs_endpoint)
+                .env("AWS_REGION", "us-east-1")
+                .env("AWS_ACCESS_KEY_ID", "e2e")
+                .env("AWS_SECRET_ACCESS_KEY", "e2e")
+                .env("RUST_LOG", "warn")
+                .spawn()?,
+        ))
+    }
+
+    /// What a deploy sends.
+    pub fn terminate(&self) -> anyhow::Result<()> {
+        let sent = Command::new("kill")
+            .args(["-TERM", &self.0.id().to_string()])
+            .status()?;
+        anyhow::ensure!(sent.success(), "kill -TERM failed");
+        Ok(())
+    }
+
+    /// No chance to clean up.
+    pub fn kill(&mut self) -> anyhow::Result<()> {
+        self.0.kill()?;
+        self.0.wait()?;
+        Ok(())
+    }
+
+    /// The exit status, or `None` if it still runs after `within`.
+    pub async fn exited(&mut self, within: Duration) -> anyhow::Result<Option<ExitStatus>> {
+        let deadline = Instant::now() + within;
+        loop {
+            if let Some(status) = self.0.try_wait()? {
+                return Ok(Some(status));
+            }
+            if Instant::now() >= deadline {
+                return Ok(None);
+            }
+            sleep(Duration::from_millis(50)).await;
+        }
+    }
+}
+
+impl Drop for RelayProcess {
+    fn drop(&mut self) {
+        let _ = self.0.kill(); // no orphans when an assertion fails
+        let _ = self.0.wait();
     }
 }

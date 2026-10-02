@@ -22,6 +22,7 @@ pub struct SqsConfig {
     pub queue_url: String,
 }
 
+#[derive(Clone)]
 pub struct SqsSink {
     client: Client,
     queue_url: String,
@@ -157,7 +158,8 @@ fn entry(
         .id(index.to_string())
         .message_body(body)
         // Lets consumers of standard queues deduplicate without parsing the body.
-        .message_attributes("id", attribute(&event.id));
+        .message_attributes("id", attribute(&event.id))
+        .message_attributes("source", attribute(&event.source));
     if !event.event_type.is_empty() {
         entry = entry.message_attributes("event_type", attribute(&event.event_type));
     }
@@ -182,7 +184,8 @@ pub(super) fn sqs_id(value: &str) -> String {
 
 /// Bytes SQS and SNS count for an entry: the body plus its message attributes, with some slack.
 pub(super) fn size(event: &OutboxEvent, body: &str) -> usize {
-    body.len() + event.id.len() + event.event_type.len() + 64
+    // Values of the id, event_type and source attributes; 64 covers their names and types.
+    body.len() + event.id.len() + event.event_type.len() + event.source.len() + 64
 }
 
 /// Splits entries into calls within `SendMessageBatch` (and `PublishBatch`) limits. An entry too large for
@@ -235,6 +238,7 @@ mod tests {
     fn event(aggregate_id: &str) -> OutboxEvent {
         OutboxEvent {
             id: "7c9e6679-7425-40de-944b-e07fc1f90ae7".into(),
+            source: "acme".into(),
             aggregate_type: "policy".into(),
             aggregate_id: aggregate_id.into(),
             event_type: "policy.approved".into(),
@@ -252,10 +256,11 @@ mod tests {
         let entry = entry(3, &event, &event.envelope(), true);
         assert_eq!(entry.id(), "3");
         assert_eq!(entry.message_body(), event.envelope());
-        assert_eq!(entry.message_group_id(), Some("policy:42"));
+        assert_eq!(entry.message_group_id(), Some("acme:policy:42"));
         assert_eq!(entry.message_deduplication_id(), Some(event.id.as_str()));
         let attributes = entry.message_attributes().unwrap();
         assert_eq!(attributes["id"].string_value(), Some(event.id.as_str()));
+        assert_eq!(attributes["source"].string_value(), Some("acme"));
         assert_eq!(
             attributes["event_type"].string_value(),
             Some("policy.approved")
@@ -275,6 +280,30 @@ mod tests {
         assert_eq!(sqs_id("policy:42"), "policy:42");
         assert_eq!(sqs_id("policy:São Paulo"), "policy:S_o_Paulo");
         assert_eq!(sqs_id(&"x".repeat(300)).len(), 128);
+    }
+
+    #[test]
+    fn size_covers_every_byte_sqs_and_sns_count() {
+        let event = OutboxEvent {
+            source: "s".repeat(63), // the longest a database name gets
+            ..event("42")
+        };
+        let body = event.envelope();
+        // They count the body, then each attribute's name, data type and value.
+        let counted = body.len()
+            + [
+                ("id", event.id.as_str()),
+                ("event_type", event.event_type.as_str()),
+                ("source", event.source.as_str()),
+            ]
+            .iter()
+            .map(|(name, value)| name.len() + "String".len() + value.len())
+            .sum::<usize>();
+        let estimated = size(&event, &body);
+        assert!(
+            estimated >= counted,
+            "estimated {estimated} < counted {counted}"
+        );
     }
 
     #[test]

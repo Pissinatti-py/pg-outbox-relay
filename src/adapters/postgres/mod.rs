@@ -4,13 +4,15 @@
 mod dead_letter;
 mod pgoutput;
 
+use std::collections::HashSet;
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::atomic::Ordering;
 use std::time::Duration;
 
 use anyhow::{Context, anyhow, bail, ensure};
-use percent_encoding::percent_decode_str;
+use metrics::Gauge;
+use percent_encoding::{NON_ALPHANUMERIC, percent_decode_str, utf8_percent_encode};
 use pgwire_replication::client::ReplicationEvent;
 use pgwire_replication::tls::rustls::maybe_upgrade_to_tls;
 use pgwire_replication::{PgWireError, ReplicationClient, ReplicationConfig, SslMode, TlsConfig};
@@ -18,7 +20,7 @@ use serde::Deserialize;
 use tokio::net::TcpStream;
 use tokio::sync::{mpsc, watch};
 
-use crate::app::Health;
+use crate::app::{Health, stopped};
 use crate::domain::{Lsn, SourceMsg};
 use crate::ports::EventSource;
 pub use dead_letter::PgDeadLetters;
@@ -38,13 +40,82 @@ pub struct PgConfig {
     pub dsn: String,
     pub slot: String,
     pub publication: String,
+    /// Relay these databases, one pipeline each; `{database}` in `dsn` and `slot` stands
+    /// for each name.
+    #[serde(default)]
+    pub databases: Vec<String>,
 }
+
+/// Stands for each entry of `databases` in the DSN and slot templates.
+const PLACEHOLDER: &str = "{database}";
 
 pub struct PgSource {
     config: PgConfig,
     health: Arc<Health>,
     /// Turns `true` when the relay should drain and stop.
     stop: watch::Receiver<bool>,
+}
+
+impl PgConfig {
+    /// The source's name: its database. It tags events and labels metrics.
+    pub fn database(&self) -> anyhow::Result<String> {
+        Ok(Dsn::parse(&self.dsn)?.dbname)
+    }
+
+    /// One concrete config per source: each entry of `databases`, or this config alone.
+    /// Checked up front, so a bad entry fails the start instead of one pipeline.
+    pub fn sources(&self) -> anyhow::Result<Vec<PgConfig>> {
+        if self.databases.is_empty() {
+            ensure!(
+                !self.dsn.contains(PLACEHOLDER) && !self.slot.contains(PLACEHOLDER),
+                "source.dsn or source.slot contain {PLACEHOLDER}, but source.databases is empty"
+            );
+            check_slot_name(&self.slot)?;
+            Dsn::parse(&self.dsn)?;
+            return Ok(vec![self.clone()]);
+        }
+        ensure!(
+            self.dsn.contains(PLACEHOLDER),
+            "source.dsn must contain {PLACEHOLDER} when source.databases is set"
+        );
+        ensure!(
+            self.slot.contains(PLACEHOLDER),
+            "source.slot must contain {PLACEHOLDER}: slot names are unique across the whole server"
+        );
+        let mut seen = HashSet::new();
+        self.databases
+            .iter()
+            .map(|database| {
+                ensure!(
+                    seen.insert(database),
+                    "source.databases lists {database} twice"
+                );
+                let encoded = utf8_percent_encode(database, NON_ALPHANUMERIC).to_string();
+                let source = PgConfig {
+                    dsn: self.dsn.replace(PLACEHOLDER, &encoded),
+                    slot: self.slot.replace(PLACEHOLDER, database),
+                    publication: self.publication.clone(),
+                    databases: Vec::new(),
+                };
+                check_slot_name(&source.slot).with_context(|| format!("database {database}"))?;
+                Dsn::parse(&source.dsn)?;
+                Ok(source)
+            })
+            .collect()
+    }
+}
+
+/// Postgres slot names: lowercase letters, digits and underscores, at most 63 bytes.
+fn check_slot_name(slot: &str) -> anyhow::Result<()> {
+    ensure!(
+        !slot.is_empty()
+            && slot.len() <= 63
+            && slot
+                .bytes()
+                .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'_'),
+        "`{slot}` is not a valid slot name: use lowercase letters, digits and underscores (at most 63)"
+    );
+    Ok(())
 }
 
 impl PgSource {
@@ -64,6 +135,10 @@ impl EventSource for PgSource {
         acked: watch::Receiver<Lsn>,
     ) -> anyhow::Result<()> {
         let dsn = Dsn::parse(&self.config.dsn)?;
+        // 1 while this relay streams the slot: across replicas, `sum by (source)` shows whether anyone does.
+        let up = metrics::gauge!("pg_outbox_source_up", "source" => dsn.dbname.clone());
+        let lag = metrics::gauge!("pg_outbox_slot_lag_bytes", "source" => dsn.dbname.clone());
+        up.set(0.0);
         let (client, first) = tokio::select! {
             connected = connect(dsn.replication(&self.config)) => connected?,
             // A standby waiting for the slot has nothing to drain.
@@ -72,12 +147,23 @@ impl EventSource for PgSource {
         dead_letter::check(&dsn).await?;
         tracing::info!(slot = %self.config.slot, "streaming from the replication slot");
         self.health.source_ready.store(true, Ordering::Relaxed);
+        up.set(1.0);
 
+        let transactions = Transactions {
+            out,
+            decoder: Decoder::default(),
+            rows: None,
+            source: dsn.dbname.clone(),
+        };
         let result = tokio::select! {
-            result = stream(client, first, out, acked, self.stop) => result,
-            () = poll_slot_lag(&dsn, &self.config.slot) => Ok(()),
+            result = stream(client, first, transactions, acked, self.stop) => result,
+            () = poll_slot_lag(&dsn, &self.config.slot, &lag) => Ok(()),
         };
         self.health.source_ready.store(false, Ordering::Relaxed);
+        up.set(0.0);
+        // Only the relay streaming the slot reports its lag: after a restart or a takeover,
+        // a stale value here would page forever.
+        lag.set(0.0);
         result
     }
 }
@@ -123,15 +209,10 @@ fn sqlstate(error: &PgWireError) -> Option<&str> {
 async fn stream(
     mut client: ReplicationClient,
     first: ReplicationEvent,
-    out: mpsc::Sender<SourceMsg>,
+    mut transactions: Transactions,
     mut acked: watch::Receiver<Lsn>,
     mut stop: watch::Receiver<bool>,
 ) -> anyhow::Result<()> {
-    let mut transactions = Transactions {
-        out,
-        decoder: Decoder::default(),
-        rows: None,
-    };
     transactions.handle(first).await?;
     loop {
         tokio::select! {
@@ -162,13 +243,6 @@ async fn stream(
     final_ack(client, last).await
 }
 
-/// Resolves once the relay is asked to stop; never if nobody can ask any more.
-async fn stopped(stop: &mut watch::Receiver<bool>) {
-    if stop.wait_for(|stop| *stop).await.is_err() {
-        std::future::pending().await
-    }
-}
-
 /// `ReplicationClient::stop` sends CopyDone without a last status update, so wait until the
 /// worker has sent `lsn` itself; otherwise the next start replays what was just published.
 async fn final_ack(mut client: ReplicationClient, lsn: Lsn) -> anyhow::Result<()> {
@@ -197,6 +271,8 @@ struct Transactions {
     /// Outbox rows of the transaction being received; `None` between transactions.
     // ponytail: a transaction's rows wait in memory for its Commit; fine for outbox-sized transactions
     rows: Option<Vec<Row>>,
+    /// The database, which every event is tagged with.
+    source: String,
 }
 
 impl Transactions {
@@ -219,8 +295,13 @@ impl Transactions {
                 let lsn = Lsn(end_lsn.0);
                 let committed_at = pg_time(commit_time_micros);
                 for row in self.rows.take().context("commit without a begin")? {
-                    self.send(SourceMsg::Event(outbox_event(row, lsn, committed_at)?))
-                        .await?;
+                    self.send(SourceMsg::Event(outbox_event(
+                        row,
+                        &self.source,
+                        lsn,
+                        committed_at,
+                    )?))
+                    .await?;
                 }
                 self.send(SourceMsg::Progress(lsn)).await?;
             }
@@ -242,10 +323,10 @@ impl Transactions {
 }
 
 /// Exports how much WAL the slot holds back, i.e. what a stuck relay costs the database.
-async fn poll_slot_lag(dsn: &Dsn, slot: &str) {
+async fn poll_slot_lag(dsn: &Dsn, slot: &str, lag: &Gauge) {
     loop {
         match slot_lag(dsn, slot).await {
-            Ok(bytes) => metrics::gauge!("pg_outbox_slot_lag_bytes").set(bytes as f64),
+            Ok(bytes) => lag.set(bytes as f64),
             Err(error) => {
                 tracing::warn!(error = format!("{error:#}"), "could not read the slot lag")
             }
@@ -359,6 +440,8 @@ impl Dsn {
         .with_tls(self.tls())
         // pgoutput sends values as text; pin their format so `created_at` parses the same everywhere.
         .with_options("-c TimeZone=UTC -c DateStyle=ISO")
+        // ponytail: bounds memory per source (N × 1024 here, and as many in the channels); raise if a benchmark says so
+        .with_buffer_size(1024)
         .with_status_interval(FEEDBACK_INTERVAL)
         .with_wakeup_interval(FEEDBACK_INTERVAL)
     }
@@ -394,6 +477,73 @@ mod tests {
         assert_eq!(dsn.port, 5432);
         assert_eq!(dsn.sslmode, SslMode::Prefer);
         assert_eq!(dsn.password, "");
+    }
+
+    fn config(dsn: &str, slot: &str, databases: &[&str]) -> PgConfig {
+        PgConfig {
+            dsn: dsn.into(),
+            slot: slot.into(),
+            publication: "outbox_pub".into(),
+            databases: databases.iter().map(|name| name.to_string()).collect(),
+        }
+    }
+
+    #[test]
+    fn one_source_per_database_from_the_templates() {
+        let sources = config(
+            "postgres://relay:pw@db:5432/{database}?sslmode=require",
+            "outbox_{database}",
+            &["acme", "acme_corp"],
+        )
+        .sources()
+        .unwrap();
+        let got: Vec<(String, String)> = sources
+            .iter()
+            .map(|s| (s.database().unwrap(), s.slot.clone()))
+            .collect();
+        assert_eq!(
+            got,
+            [
+                ("acme".to_owned(), "outbox_acme".to_owned()),
+                ("acme_corp".to_owned(), "outbox_acme_corp".to_owned()),
+            ]
+        );
+        assert!(
+            sources
+                .iter()
+                .all(|s| s.dsn.ends_with("?sslmode=require") && s.databases.is_empty())
+        );
+    }
+
+    #[test]
+    fn without_databases_the_config_is_its_own_single_source() {
+        let sources = config("postgres://relay@db/app", "outbox_relay", &[])
+            .sources()
+            .unwrap();
+        assert_eq!(sources.len(), 1);
+        assert_eq!(sources[0].database().unwrap(), "app");
+        assert_eq!(sources[0].slot, "outbox_relay");
+    }
+
+    #[test]
+    fn rejects_database_lists_that_cannot_work() {
+        let dsn = "postgres://relay@db/{database}";
+        for (bad, why) in [
+            (
+                config("postgres://relay@db/app", "outbox_{database}", &["acme"]),
+                "{database}",
+            ),
+            (config(dsn, "outbox_relay", &["acme"]), "server"),
+            (config(dsn, "outbox_{database}", &["acme", "acme"]), "twice"),
+            (
+                config(dsn, "outbox_{database}", &["acme-corp"]),
+                "acme-corp",
+            ),
+            (config(dsn, "outbox_{database}", &[]), "databases"),
+        ] {
+            let error = bad.sources().unwrap_err();
+            assert!(format!("{error:#}").contains(why), "{error:#}");
+        }
     }
 
     #[test]

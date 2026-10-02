@@ -8,7 +8,7 @@
 - **Ordered per aggregate:** events of the same `aggregate_type` + `aggregate_id` arrive in commit order.
 - **Idempotent consumers made easy:** every event carries a stable `id` to deduplicate on.
 
-> **Status: milestone 2.** SQS and SNS (FIFO and standard) and Redis Streams, with a dead-letter table, graceful drain on SIGTERM and TLS on every Postgres connection. Multi-database relaying comes next; see the [Roadmap](#roadmap).
+> **Status: milestone 3.** One relay serves many tenant databases (one slot each), publishing to SQS, SNS or Redis Streams. Benchmarks come next; see the [Roadmap](#roadmap).
 
 ---
 
@@ -17,13 +17,14 @@
 1. [Why](#why)
 2. [How it works](#how-it-works)
 3. [Quickstart (5 minutes)](#quickstart-5-minutes)
-4. [Integrate your application](#integrate-your-application)
+4. [Integrate your application](#integrate-your-application) (including [several databases](#4-several-databases-one-per-tenant))
 5. [Examples](#examples)
 6. [Configure](#configure)
 7. [Operate](#operate)
 8. [Delivery semantics](#delivery-semantics)
-9. [Develop](#develop)
-10. [Roadmap](#roadmap)
+9. [Upgrading from M2](#upgrading-from-m2)
+10. [Develop](#develop)
+11. [Roadmap](#roadmap)
 
 ---
 
@@ -100,10 +101,10 @@ curl -s localhost:9324 \
        "MessageSystemAttributeNames": ["MessageGroupId"], "MessageAttributeNames": ["All"]}'
 ```
 
-The message body is the event envelope. `MessageGroupId` is `policy:42`, and the event `id` is also the FIFO deduplication id:
+The message body is the event envelope, and `source` is the database it was committed in. `MessageGroupId` is `app:policy:42`, and the event `id` is also the FIFO deduplication id:
 
 ```json
-{"id":"0fafad7a-fd18-4f77-a13e-3dd92bd7ac61","aggregate_type":"policy","aggregate_id":"42","event_type":"policy.approved","occurred_at":"2026-09-28T16:21:58.774339Z","headers":{"tenant": "acme"},"payload":{"policy_id": 42}}
+{"id":"0fafad7a-fd18-4f77-a13e-3dd92bd7ac61","source":"app","aggregate_type":"policy","aggregate_id":"42","event_type":"policy.approved","occurred_at":"2026-09-28T16:21:58.774339Z","headers":{"tenant": "acme"},"payload":{"policy_id": 42}}
 ```
 
 **3. Watch it:**
@@ -226,10 +227,32 @@ If the transaction rolls back, the event never existed. If it commits, it will b
 
 Each SQS message body is the envelope shown in the [Quickstart](#quickstart-5-minutes). Keep these in mind:
 - **Deduplicate on `id`.** Delivery is at-least-once. A FIFO queue drops duplicates within its 5-minute deduplication window. Beyond that, record processed ids, for example with a processed-events table or a Redis `SET NX`.
-- **FIFO queues** deliver each aggregate's events in commit order (`MessageGroupId = aggregate_type:aggregate_id`). **Standard queues** also work but do not keep order; the `id` is available as a message attribute there too.
-- **SNS:** subscribe queues with raw message delivery, so the body is the envelope. `id` and `event_type` are message attributes, usable in subscription filter policies. A `.fifo` topic keeps the same per-aggregate order and delivers to `.fifo` queues.
-- **Redis Streams:** each entry has `id`, `event_type` and `envelope` (the JSON above), in the stream `outbox:<aggregate_type>`. An aggregate's events stay in order within its stream. Read with `XREADGROUP` and deduplicate on `id`. The relay never trims: use `XTRIM <stream> MINID <id>` once every consumer group has passed an entry (`MAXLEN` drops entries a lagging group has not read).
+- **FIFO queues** deliver each aggregate's events in commit order (`MessageGroupId = source:aggregate_type:aggregate_id`). **Standard queues** also work but do not keep order; the `id` is available as a message attribute there too.
+- **SNS:** subscribe queues with raw message delivery, so the body is the envelope. `id`, `event_type` and `source` are message attributes, usable in subscription filter policies. A `.fifo` topic keeps the same per-aggregate order and delivers to `.fifo` queues.
+- **Redis Streams:** each entry has `id`, `source`, `event_type` and `envelope` (the JSON above), in the stream `outbox:<aggregate_type>`. An aggregate's events stay in order within its stream. Read with `XREADGROUP` and deduplicate on `id`. The relay never trims: use `XTRIM <stream> MINID <id>` once every consumer group has passed an entry (`MAXLEN` drops entries a lagging group has not read).
 - **Rows can be deleted** once they are published, for example with a nightly job that deletes rows older than 7 days, or with daily partitions you drop. The WAL already carried them. If you partition `outbox`, create the publication `WITH (publish = 'insert', publish_via_partition_root = true)`.
+
+### 4. Several databases (one per tenant)
+
+One relay can serve every tenant database on a Postgres server, each through its own pipeline. List the databases, and use `{database}` in the DSN and in the slot name, since slot names are unique across the whole server:
+
+```bash
+RELAY__SOURCE__DSN=postgres://relay:...@db:5432/{database}?sslmode=verify-full
+RELAY__SOURCE__SLOT=outbox_{database}
+RELAY__SOURCE__PUBLICATION=outbox_pub
+RELAY__SOURCE__DATABASES=acme,globex,initech
+```
+
+In each tenant database, run `sql/outbox.sql`, grant the relay INSERT on `outbox_dead_letter`, and create the database's slot outside a transaction:
+
+```sql
+SELECT pg_create_logical_replication_slot('outbox_' || current_database(), 'pgoutput');
+```
+
+- **Tenants are isolated.** A database that is down, or whose slot is missing, is retried with a backoff (1 s, growing to 60 s) while every other tenant keeps streaming. `pg_outbox_source_up{source}` and the `OutboxSourceDown` alert show it.
+- **Events carry their database** in `source`, and FIFO groups start with it, so two tenants' `policy:42` never share a group.
+- **Adding a tenant** means adding it to the list and restarting the relay. The restart drains, so nothing replays.
+- **Postgres limits:** raise `max_replication_slots` and `max_wal_senders` above the number of tenants (both default to 10), with a few spare for a standby's connection attempts. Every slot's connection reads the server's whole WAL, so about 30 tenants per server is comfortable.
 
 ## Examples
 
@@ -268,7 +291,7 @@ RELAY__SINK__KIND=sqs
 RELAY__SINK__QUEUE_URL=https://sqs.us-east-1.amazonaws.com/123456789012/fulfillment.fifo
 ```
 
-Every event of order 1234 carries `MessageGroupId = order:1234`. SQS FIFO releases the next message of a group only after the previous one is deleted, so `order.cancelled` waits until `order.paid` has been handled. Different orders are still processed in parallel.
+Every event of order 1234 carries `MessageGroupId = app:order:1234` (`app` being its database). SQS FIFO releases the next message of a group only after the previous one is deleted, so `order.cancelled` waits until `order.paid` has been handled. Different orders are still processed in parallel.
 
 **Worker (sketch):** record the event `id` in the same database transaction as the work.
 
@@ -325,7 +348,7 @@ with transaction.atomic():
 RELAY__SINK__QUEUE_URL=https://sqs.us-east-1.amazonaws.com/123456789012/notifications
 ```
 
-Standard queues don't deduplicate, and SQS itself can deliver a message twice. The relay therefore also puts the event `id` and `event_type` in message attributes, so the worker can check them without parsing the body.
+Standard queues don't deduplicate, and SQS itself can deliver a message twice. The relay therefore also puts the event `id`, `event_type` and `source` in message attributes, so the worker can check them without parsing the body.
 
 **Worker (sketch):**
 
@@ -417,9 +440,10 @@ The relay reads a TOML file (first argument, default `./relay.toml`), then envir
 
 | Setting | Environment variable | Default | Meaning |
 |---|---|---|---|
-| `source.dsn` | `RELAY__SOURCE__DSN` | required | `postgres://user:password@host:5432/db?sslmode=verify-full&sslrootcert=/ca.pem`. `sslmode`: `disable`, `prefer` (default), `require`, `verify-ca`, `verify-full`. It applies to every connection: replication, slot lag and dead letters |
-| `source.slot` | `RELAY__SOURCE__SLOT` | required | Replication slot, for example `outbox_relay` |
+| `source.dsn` | `RELAY__SOURCE__DSN` | required | `postgres://user:password@host:5432/db?sslmode=verify-full&sslrootcert=/ca.pem`. `sslmode`: `disable`, `prefer` (default), `require`, `verify-ca`, `verify-full`. It applies to every connection: replication, slot lag and dead letters. With `source.databases`, `{database}` stands for each name |
+| `source.slot` | `RELAY__SOURCE__SLOT` | required | Replication slot, for example `outbox_relay`. With `source.databases`, a template such as `outbox_{database}`: slot names are unique across the server |
 | `source.publication` | `RELAY__SOURCE__PUBLICATION` | required | Publication, for example `outbox_pub` |
+| `source.databases` | `RELAY__SOURCE__DATABASES` | empty | Relay these databases, one pipeline each (comma-separated in the environment). See [Several databases](#4-several-databases-one-per-tenant) |
 | `sink.kind` | `RELAY__SINK__KIND` | required | `sqs`, `sns` or `redis` |
 | `sink.queue_url` | `RELAY__SINK__QUEUE_URL` | required for `sqs` | A `.fifo` URL enables ordering and deduplication |
 | `sink.topic_arn` | `RELAY__SINK__TOPIC_ARN` | required for `sns` | A `.fifo` ARN enables ordering and deduplication |
@@ -438,7 +462,7 @@ The relay reads a TOML file (first argument, default `./relay.toml`), then envir
 ## Operate
 
 **Deploy** the Docker image (`docker build -t pg-outbox-relay .`, a distroless image of about 50 MB) or the binary.
-- **High availability:** run **two replicas** against the same slot. Postgres lets only one consume it; the other waits (`/readyz` → 503) and takes over about 5 s after the first one's connection closes. No leader election is needed.
+- **High availability:** run **two replicas** against the same slot. Postgres lets only one consume it; the other waits (`/readyz` → 503) and takes over about 5 s after the first one's connection closes. No leader election is needed. With several databases, the two replicas share the slots: each is streamed by exactly one of them.
 - **Shutdown:** SIGTERM drains (see [Delivery semantics](#delivery-semantics)). Against a healthy broker that takes well under a second, so the default grace periods (Kubernetes 30 s, `docker stop` 10 s) are plenty.
 - **Kubernetes:** don't make `/readyz` a readiness probe of a Deployment with `maxUnavailable: 0`. The standby is never ready by design, so a rollout would wait forever. Use `strategy: Recreate`, or keep `/readyz` for monitoring only. `/healthz` is the liveness probe.
 
@@ -447,23 +471,27 @@ The relay reads a TOML file (first argument, default `./relay.toml`), then envir
 | Endpoint | Meaning |
 |---|---|
 | `GET /healthz` | 200 when the process is alive |
-| `GET /readyz` | 200 when it streams from the slot **and** the last publish succeeded; 503 otherwise |
+| `GET /readyz` | 200 when at least one of its sources streams from its slot **and** its last publish succeeded; 503 otherwise |
 | `GET /metrics` | Prometheus metrics |
 
 **Metrics:**
 
 | Metric | Type | Use it for |
 |---|---|---|
-| `pg_outbox_events_published_total{sink}` | counter | Throughput |
-| `pg_outbox_publish_errors_total{sink,kind}` | counter | Broker health. `kind` is `retryable` or `permanent` |
-| `pg_outbox_publish_latency_seconds` | histogram | Commit → broker acknowledgement |
-| `pg_outbox_slot_lag_bytes` | gauge | **The main alert signal:** WAL the slot holds back |
-| `pg_outbox_dead_letters_total` | counter | Events rejected for good (stored in `outbox_dead_letter`) |
-| `pg_outbox_channel_depth` | gauge | Backpressure: near 1024 means the broker is the bottleneck |
+| `pg_outbox_events_published_total{sink,source}` | counter | Throughput |
+| `pg_outbox_publish_errors_total{sink,kind,source}` | counter | Broker health. `kind` is `retryable` or `permanent` |
+| `pg_outbox_publish_latency_seconds{source}` | histogram | Commit → broker acknowledgement |
+| `pg_outbox_slot_lag_bytes{source}` | gauge | **The main alert signal:** WAL the slot holds back |
+| `pg_outbox_source_up{source}` | gauge | 1 while this relay streams the source's slot. `sum by (source)` across replicas shows whether anyone does |
+| `pg_outbox_dead_letters_total{source}` | counter | Events rejected for good (stored in `outbox_dead_letter`) |
+| `pg_outbox_channel_depth{source}` | gauge | Backpressure: near 1024 means the broker is the bottleneck |
 
-**Alerts:** [`deploy/prometheus/alerts.yml`](deploy/prometheus/alerts.yml) ships four rules:
+`source` is the database the relay reads, and `sink` the broker (`sqs`, `sns` or `redis`).
+
+**Alerts:** [`deploy/prometheus/alerts.yml`](deploy/prometheus/alerts.yml) ships five rules, each per source where it applies:
 - `OutboxSlotLagHigh`;
 - `OutboxRelayDown`, because while the relay is down its lag metric disappears but the slot keeps growing;
+- `OutboxSourceDown`, when no relay streams a source (its database is down or its slot is missing);
 - `OutboxPublishStalled`;
 - `OutboxPoisonEvents`.
 
@@ -486,12 +514,20 @@ To republish one after fixing the cause, insert a corrected row into `outbox` wi
 |---|---|
 | The relay crashes after publishing, before acknowledging | On restart Postgres replays from the last ack: duplicates with the **same `id`**. FIFO queues drop them within 5 minutes |
 | The broker is down, throttling, or credentials are wrong | Retried forever with backoff. The slot keeps the WAL, `/readyz` turns 503, `OutboxPublishStalled` fires. Nothing is lost |
-| The database restarts or the connection drops | The relay exits (crash-only design), the orchestrator restarts it, it waits for the database and resumes from the last ack |
+| The database restarts or the connection drops | That source's pipeline restarts after a backoff (1 s, growing to 60 s), waits for the database and resumes from its last ack. The other sources keep streaming |
 | A transaction rolls back | It never reaches the WAL stream, so it is never published |
 | The broker (SQS or SNS) rejects an event for good (invalid content, too large) | Stored in `outbox_dead_letter` with the broker's reason (retried until it is), logged at `ERROR`, counted in `pg_outbox_dead_letters_total`, then skipped so one bad row cannot block the stream. Redis never rejects content, so the Redis sink never dead-letters |
 | SIGTERM (deploys) | Stops reading the WAL at a transaction boundary, publishes everything already read, sends a final ack, and exits 0, so the next start replays nothing. During a broker outage the drain waits. A second SIGTERM/SIGINT, or the orchestrator's SIGKILL, stops it, and unacknowledged events replay |
 
 Exactly-once is not a goal. It is the consumer's job, made possible by `id`.
+
+## Upgrading from M2
+
+A single-database config needs no changes. What consumers and operators see:
+- **Events gain `source`**, the database they were committed in: a field in the envelope, a `source` message attribute on SQS and SNS, a `source` field on Redis Streams.
+- **FIFO `MessageGroupId` gains a `<database>:` prefix.** An aggregate's last event before the upgrade and its first event after it land in different groups, so drain the queue before upgrading if that ordering matters.
+- **Every metric gains a `source` label.** The shipped alerts and dashboard are updated, and there is a new `pg_outbox_source_up` gauge and `OutboxSourceDown` alert.
+- **A source error no longer exits the process.** A database that is down or a missing slot restarts that source's pipeline after a backoff, and `pg_outbox_source_up` shows it.
 
 ## Develop
 
@@ -534,8 +570,8 @@ Decisions are recorded in [docs/adr/](docs/adr/), for example why the replicatio
 |---|---|---|
 | **M1** | Replication source, SQS FIFO sink, LSN checkpointing, metrics and health, Docker Compose demo, end-to-end test | ✅ done |
 | **M2** | SNS and Redis Streams sinks, `outbox_dead_letter` table, graceful drain on SIGTERM, TLS for SQL connections, process-kill crash test in CI | ✅ done |
-| **M3** | Multi-source: one process relays N databases (one slot per tenant database). Until then, run one relay per database | next |
-| **M4** | Benchmarks (events/s, p99 latency, memory) against a Python polling relay | planned |
+| **M3** | Multi-source: one process relays N databases (one slot per tenant database) | ✅ done |
+| **M4** | Benchmarks (events/s, p99 latency, memory) against a Python polling relay | next |
 
 Non-goals: exactly-once end to end, general-purpose CDC for arbitrary tables (use Debezium), and schema registries or routing DSLs.
 

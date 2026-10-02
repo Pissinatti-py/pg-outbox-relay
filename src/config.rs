@@ -59,12 +59,20 @@ impl Config {
             .prefix_separator("__")
             .separator("__")
             .try_parsing(true)
+            .list_separator(",")
+            .with_list_parse_key("source.databases")
             .source(env);
-        let config = config::Config::builder()
+        let config: Self = config::Config::builder()
             .add_source(File::new(path, FileFormat::Toml).required(false))
             .add_source(overrides)
             .build()?
             .try_deserialize()?;
+        // Checked before any pipeline starts: each would only fail and retry forever,
+        // with no source-labelled metric for an alert to see.
+        anyhow::ensure!(
+            config.batching.max_events > 0,
+            "batching.max_events must be at least 1"
+        );
         Ok(config)
     }
 }
@@ -165,6 +173,36 @@ mod tests {
         };
         assert_eq!(redis.url, "redis://cache:6379");
         assert_eq!(redis.stream_prefix, "outbox:");
+    }
+
+    #[test]
+    fn the_environment_lists_databases() {
+        let config = Config::from(
+            "does-not-exist.toml",
+            env(&[
+                ("RELAY__SOURCE__DSN", "postgres://relay@db/{database}"),
+                ("RELAY__SOURCE__SLOT", "outbox_{database}"),
+                ("RELAY__SOURCE__PUBLICATION", "outbox_pub"),
+                ("RELAY__SOURCE__DATABASES", "acme,globex"),
+                ("RELAY__SINK__KIND", "sqs"),
+                (
+                    "RELAY__SINK__QUEUE_URL",
+                    "https://sqs.us-east-1.amazonaws.com/1/e.fifo",
+                ),
+            ]),
+        )
+        .unwrap();
+        assert_eq!(config.source.databases, ["acme", "globex"]);
+    }
+
+    #[test]
+    fn rejects_a_batch_size_of_zero() {
+        let result = Config::from(
+            "relay.example.toml",
+            env(&[("RELAY__BATCHING__MAX_EVENTS", "0")]),
+        );
+        let error = result.expect_err("a batch size of 0 must fail the start");
+        assert!(format!("{error:#}").contains("max_events"), "{error:#}");
     }
 
     #[test]

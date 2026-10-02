@@ -44,6 +44,7 @@ async fn the_dead_letter_table_is_checked_at_start_and_written_once() -> anyhow:
     let dead_letters = PgDeadLetters::new(&config)?;
     let event = OutboxEvent {
         id: "7c9e6679-7425-40de-944b-e07fc1f90ae7".into(),
+        source: "postgres".into(),
         aggregate_type: "policy".into(),
         aggregate_id: "42".into(),
         event_type: "policy.approved".into(),

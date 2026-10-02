@@ -17,6 +17,7 @@ pub struct SnsConfig {
     pub topic_arn: String,
 }
 
+#[derive(Clone)]
 pub struct SnsSink {
     client: Client,
     topic_arn: String,
@@ -149,7 +150,8 @@ fn entry(index: usize, event: &OutboxEvent, body: &str, fifo: bool) -> PublishBa
         .id(index.to_string())
         .message(body)
         // Subscribers can deduplicate on `id` and filter on `event_type` without parsing the body.
-        .message_attributes("id", attribute(&event.id));
+        .message_attributes("id", attribute(&event.id))
+        .message_attributes("source", attribute(&event.source));
     if !event.event_type.is_empty() {
         entry = entry.message_attributes("event_type", attribute(&event.event_type));
     }
@@ -173,6 +175,7 @@ mod tests {
     fn event() -> OutboxEvent {
         OutboxEvent {
             id: "7c9e6679-7425-40de-944b-e07fc1f90ae7".into(),
+            source: "acme".into(),
             aggregate_type: "policy".into(),
             aggregate_id: "42".into(),
             event_type: "policy.approved".into(),
@@ -190,10 +193,11 @@ mod tests {
         let entry = entry(3, &event, &event.envelope(), true);
         assert_eq!(entry.id(), "3");
         assert_eq!(entry.message(), event.envelope());
-        assert_eq!(entry.message_group_id(), Some("policy:42"));
+        assert_eq!(entry.message_group_id(), Some("acme:policy:42"));
         assert_eq!(entry.message_deduplication_id(), Some(event.id.as_str()));
         let attributes = entry.message_attributes().unwrap();
         assert_eq!(attributes["id"].string_value(), Some(event.id.as_str()));
+        assert_eq!(attributes["source"].string_value(), Some("acme"));
         assert_eq!(
             attributes["event_type"].string_value(),
             Some("policy.approved")
