@@ -18,7 +18,7 @@
 2. [How it works](#how-it-works)
 3. [Quickstart (5 minutes)](#quickstart-5-minutes)
 4. [Integrate your application](#integrate-your-application) (including [several databases](#4-several-databases-one-per-tenant))
-5. [Examples](#examples)
+5. [Example: order paid → fulfillment](#example-order-paid--fulfillment-worker)
 6. [Configure](#configure)
 7. [Operate](#operate)
 8. [Delivery semantics](#delivery-semantics)
@@ -254,19 +254,9 @@ SELECT pg_create_logical_replication_slot('outbox_' || current_database(), 'pgou
 - **Adding a tenant** means adding it to the list and restarting the relay. The restart drains, so nothing replays. **Removing one** means taking it off the list, restarting, then dropping its slot (`SELECT pg_drop_replication_slot('outbox_<name>')`): a slot nobody reads keeps WAL for the whole server, and once its source is off the list, no alert sees it.
 - **Postgres limits:** raise `max_replication_slots` and `max_wal_senders` above the number of tenants (both default to 10), with a few spare for a standby's connection attempts. Every slot's connection reads the server's whole WAL, so about 30 tenants per server is comfortable.
 
-## Examples
+## Example: order paid → fulfillment worker
 
-Three common ways to use the relay with SQS. SNS and Redis Streams work the same way: pick the sink in [Configure](#configure).
-
-| Example | Queue | Why that queue | The idea to take away |
-|---|---|---|---|
-| [Order paid → fulfillment](#example-1-order-paid--fulfillment-worker) | FIFO | Each order's events must be handled in sequence | One aggregate = one ordered stream |
-| [Policy approved → e-mail](#example-2-policy-approved--notification-e-mail) | Standard | No ordering needed, higher throughput | Replace `on_commit` side effects; send each e-mail once |
-| [Search index in sync](#example-3-keeping-a-search-index-in-sync) | FIFO | Each document's updates must apply in sequence | State-carrying events, a version guard, fan-out with a second relay |
-
-The consumer snippets are sketches of the `handle(message)` step. Around it runs the usual SQS loop: long-poll `ReceiveMessage`, call `handle`, then `DeleteMessage` once it returns.
-
-### Example 1: Order paid → fulfillment worker
+How the relay fits a typical flow, with SQS. SNS and Redis Streams work the same way: pick the sink in [Configure](#configure).
 
 **The problem.** When an order is paid, the fulfillment service reserves stock and ships it.
 - **Separate commit and publish can go wrong both ways.** A crash between the commit and the publish leaves a paid order that never ships. Publishing first can ship an order whose payment then rolls back.
@@ -293,7 +283,7 @@ RELAY__SINK__QUEUE_URL=https://sqs.us-east-1.amazonaws.com/123456789012/fulfillm
 
 Every event of order 1234 carries `MessageGroupId = app:order:1234` (`app` being its database). SQS FIFO releases the next message of a group only after the previous one is deleted, so `order.cancelled` waits until `order.paid` has been handled. Different orders are still processed in parallel.
 
-**Worker (sketch):** record the event `id` in the same database transaction as the work.
+**Worker (sketch):** record the event `id` in the same database transaction as the work. Around this `handle(message)` runs the usual SQS loop: long-poll `ReceiveMessage`, call `handle`, then `DeleteMessage` once it returns.
 
 ```python
 def handle(message):
@@ -313,126 +303,6 @@ def handle(message):
 - **The payment and its event commit together.** There is no lost `order.paid` and no event for a payment that rolled back.
 - **The group ID keeps each order in sequence.**
 - **The `processed_events` row commits together with the stock change.** If the work fails, both roll back and the message is retried. If the relay replays the event after a crash, the unique `id` turns it into a no-op.
-
-### Example 2: Policy approved → notification e-mail
-
-**The problem.** Django apps often trigger side effects with `transaction.on_commit`:
-
-```python
-with transaction.atomic():
-    policy.status = "approved"
-    policy.save()
-    transaction.on_commit(lambda: send_approval_email.delay(policy.id))
-```
-
-The callback runs in the same process, after the commit. If the process dies at that moment, or the Celery broker is unreachable, the task is never queued: the policy is approved and nobody is told. It is the dual write again, just harder to notice.
-
-**Producer:** one more row in the same transaction. This uses the `Outbox` model from [Integrate your application](#2-insert-events-in-the-same-transaction-as-your-change).
-
-```python
-with transaction.atomic():
-    policy.status = "approved"
-    policy.save()
-    Outbox.objects.create(
-        aggregate_type="policy",
-        aggregate_id=str(policy.id),
-        event_type="policy.approved",
-        payload={"policy_id": policy.id, "holder_email": policy.holder_email},
-        headers={"tenant": tenant.slug},
-    )
-```
-
-**Relay:** a standard queue is enough, because e-mails need no ordering.
-
-```bash
-RELAY__SINK__QUEUE_URL=https://sqs.us-east-1.amazonaws.com/123456789012/notifications
-```
-
-Standard queues don't deduplicate, and SQS itself can deliver a message twice. The relay therefore also puts the event `id`, `event_type` and `source` in message attributes, so the worker can check them without parsing the body.
-
-**Worker (sketch):**
-
-```python
-def handle(message):
-    event = json.loads(message["Body"])
-    if event["event_type"] != "policy.approved":
-        return  # every outbox event reaches this queue; skip the ones that aren't notifications
-    key = f"notified:{event['id']}"
-    if redis.exists(key):
-        return  # this event was already e-mailed
-    send_email(
-        to=event["payload"]["holder_email"],
-        template="policy_approved",
-        tenant=event["headers"]["tenant"],
-    )
-    redis.set(key, 1, ex=7 * 24 * 3600)  # marked after sending, so a failed send is retried
-```
-
-A crash between sending and marking can still send one duplicate. If your e-mail provider supports idempotency keys, pass `event["id"]` and that gap closes too.
-
-### Example 3: Keeping a search index in sync
-
-**The problem.** Products are edited in Postgres and searched in Elasticsearch or OpenSearch. The same applies to a cache or a reporting database. Updating the index inside the request is another dual write. A failed index call leaves search stale for good, or fails the user's request over something secondary.
-
-**Producer:** publish the product's *new state*, including a version that increases with every change. One statement does both:
-
-```sql
-WITH p AS (
-    UPDATE products SET price_cents = 1990, version = version + 1 WHERE id = 7
-    RETURNING id, name, price_cents, version
-)
-INSERT INTO outbox (id, aggregate_type, aggregate_id, event_type, payload)
-SELECT gen_random_uuid(), 'product', p.id::text, 'product.updated', to_jsonb(p) FROM p;
-```
-
-The consumer receives `"payload": {"id": 7, "name": "Blue mug", "version": 12, "price_cents": 1990}`. The indexer never has to query the database, and the version lets it ignore anything older than what it already has.
-
-**Relay:** a FIFO queue, so each product's updates arrive in sequence.
-
-```bash
-RELAY__SINK__QUEUE_URL=https://sqs.us-east-1.amazonaws.com/123456789012/search-indexer.fifo
-```
-
-**Indexer (sketch):** use Elasticsearch/OpenSearch external versioning.
-
-```python
-def handle(message):
-    event = json.loads(message["Body"])
-    doc = event["payload"]
-    try:
-        if event["event_type"] == "product.updated":
-            es.index(index="products", id=doc["id"], document=doc,
-                     version=doc["version"], version_type="external")
-        elif event["event_type"] == "product.deleted":
-            es.delete(index="products", id=doc["id"],
-                      version=doc["version"], version_type="external")
-    except ConflictError:
-        pass  # the index already holds this version or a newer one: a duplicate or stale event
-```
-
-**Feeding several services from the same events (fan-out).** A relay publishes to one queue. To deliver the same events to both the search indexer and the notification service, run **one relay per queue**, each with its own replication slot:
-
-```sql
-SELECT pg_create_logical_replication_slot('outbox_search', 'pgoutput');  -- outside a transaction
-```
-
-```bash
-RELAY__SOURCE__SLOT=outbox_search
-RELAY__SINK__QUEUE_URL=https://sqs.us-east-1.amazonaws.com/123456789012/search-indexer.fifo
-```
-
-Each relay reads the same publication and acknowledges its own slot:
-- **Independence:** a slow indexer never delays notifications.
-- **Cost:** each slot also keeps WAL until its own relay catches up, so watch `pg_outbox_slot_lag_bytes` for every relay.
-
-Or publish to an SNS topic instead: one relay and one slot, and each service subscribes its own queue (raw message delivery on), with a filter policy on `event_type` if it only needs some events.
-
-```bash
-RELAY__SINK__KIND=sns
-RELAY__SINK__TOPIC_ARN=arn:aws:sns:us-east-1:123456789012:products.fifo
-```
-
-**Building the index the first time.** A slot streams changes from the moment it's created; it isn't a backfill tool. Build the initial index from the `products` table, then let the relay keep it current. The version check makes any overlap between the two harmless.
 
 ## Configure
 
