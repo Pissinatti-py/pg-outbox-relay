@@ -117,6 +117,7 @@ The core may use two facades, much like `log`: `tracing` for logs and `metrics` 
 | End to end: Postgres 17 → relay → SNS FIFO topic → SQS FIFO queue (moto) | `tests/e2e_sns.rs` | `cargo test -- --ignored` | Docker |
 | End to end: Postgres 17 → relay → Redis Streams | `tests/e2e_redis.rs` | `cargo test -- --ignored` | Docker |
 | The Postgres adapter against a real database: the dead-letter table and its startup check | `tests/e2e_postgres.rs` | `cargo test -- --ignored` | Docker |
+| End to end: three tenant databases → the relay binary → one SQS FIFO queue: per-tenant tags and groups, and broken tenants (a missing slot, a severed stream) isolated, then recovering | `tests/e2e_tenants.rs` | `cargo test -- --ignored` | Docker |
 | The relay binary under signals: SIGTERM drains without replays, a second signal ends a stuck drain, SIGKILL loses nothing | `tests/crash.rs` | `cargo test -- --ignored` | Docker |
 
 The SQS tests use ElasticMQ, a local SQS, and the SNS test uses moto, because LocalStack now needs an account token. ElasticMQ does not enforce SQS's message-size limit, so the oversized-event path is covered by unit tests only; verify it against real SQS.

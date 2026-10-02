@@ -3,7 +3,7 @@
 
 mod common;
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::time::Duration;
 
 use pg_outbox_relay::adapters::postgres::PgConfig;
@@ -14,7 +14,7 @@ async fn relays_every_tenant_database_and_isolates_a_broken_one() -> anyhow::Res
     let pg = common::postgres().await?;
     let acme = pg.tenant("acme", true).await?;
     let globex = pg.tenant("globex", true).await?;
-    pg.tenant("initech", false).await?; // listed, but its slot does not exist yet
+    let initech = pg.tenant("initech", false).await?; // listed, but its slot does not exist yet
     let (_elasticmq, endpoint) = common::elasticmq().await?;
     let sqs = aws_sdk_sqs::Client::new(&common::aws(&endpoint).await);
     let queue_url = common::create_queue(&sqs, "events.fifo").await?;
@@ -61,10 +61,51 @@ async fn relays_every_tenant_database_and_isolates_a_broken_one() -> anyhow::Res
     }
     common::assert_ordered_per_aggregate(&received);
 
-    // initech keeps failing without stopping the others, and a deploy still drains cleanly.
+    // Broken sources recover on their own, while the relay keeps running: acme's stream
+    // breaks with writes in flight, and initech's slot appears.
+    common::insert(&acme, 200, 30, 3, 3).await?;
+    let broken: Option<bool> = pg
+        .db
+        .query_one(
+            "SELECT pg_terminate_backend(active_pid) FROM pg_replication_slots \
+             WHERE slot_name = 'outbox_acme'",
+            &[],
+        )
+        .await?
+        .get(0);
+    assert_eq!(broken, Some(true), "acme was not streaming");
+    initech
+        .batch_execute("SELECT pg_create_logical_replication_slot('outbox_initech', 'pgoutput')")
+        .await?;
+    common::insert(&globex, 300, 30, 3, 3).await?;
+    common::insert(&initech, 400, 30, 3, 3).await?;
+    for (name, db) in [("acme", &acme), ("globex", &globex), ("initech", &initech)] {
+        for id in common::ids_in(db).await? {
+            tenant_of.insert(id, name);
+        }
+    }
+    let inserted: HashSet<String> = tenant_of.keys().cloned().collect();
+    // Long enough for initech's restart backoff, which has grown since the relay started.
+    common::receive(
+        &sqs,
+        &queue_url,
+        &mut received,
+        |r| common::ids(r) == inserted,
+        Duration::from_secs(90),
+    )
+    .await?;
+    let missing = inserted.difference(&common::ids(&received)).count();
+    assert_eq!(missing, 0, "{missing} events lost");
+    // Duplicates are allowed: acme replays what it had not acknowledged.
+    for r in &received {
+        let id = r.envelope["id"].as_str().unwrap();
+        assert_eq!(r.envelope["source"], tenant_of[id], "{id}");
+    }
+
+    // The broken sources never stopped the relay, and a deploy still drains cleanly.
     assert!(
         relay.exited(Duration::ZERO).await?.is_none(),
-        "one broken source stopped the relay"
+        "a broken source stopped the relay"
     );
     relay.terminate()?;
     let status = relay.exited(Duration::from_secs(15)).await?;
