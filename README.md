@@ -518,7 +518,7 @@ To republish one after fixing the cause, insert a corrected row into `outbox` wi
 | The database restarts or the connection drops | That source's pipeline restarts after a backoff (1 s, growing to 60 s), waits for the database and resumes from its last ack. The other sources keep streaming |
 | A transaction rolls back | It never reaches the WAL stream, so it is never published |
 | The broker (SQS or SNS) rejects an event for good (invalid content, too large) | Stored in `outbox_dead_letter` with the broker's reason (retried until it is), logged at `ERROR`, counted in `pg_outbox_dead_letters_total`, then skipped so one bad row cannot block the stream. Redis never rejects content, so the Redis sink never dead-letters |
-| SIGTERM (deploys) | Stops reading the WAL at a transaction boundary, publishes everything already read, sends a final ack, and exits 0, so the next start replays nothing. During a broker outage the drain waits. A second SIGTERM/SIGINT, or the orchestrator's SIGKILL, stops it, and unacknowledged events replay |
+| SIGTERM (deploys) | Stops reading the WAL at a transaction boundary, publishes everything already read, sends a final ack, and exits 0, so the next start replays nothing. If a source cannot send its final ack, the relay exits 1, and the next start replays what that ack would have covered. During a broker outage the drain waits. A second SIGTERM/SIGINT, or the orchestrator's SIGKILL, stops it, and unacknowledged events replay |
 
 Exactly-once is not a goal. It is the consumer's job, made possible by `id`.
 

@@ -109,20 +109,34 @@ pub async fn run<K: EventSink, D: DeadLetterStore>(
 /// Runs a source's relay until it stops cleanly or the relay stops, restarting it after a
 /// failure. Crash-only, per source: a restart resumes from the slot's last ack, like a
 /// process restart would, so only this source replays and every other source keeps going.
-pub async fn supervise<F>(name: &str, mut stop: watch::Receiver<bool>, mut start: impl FnMut() -> F)
+/// A failure while the relay stops, such as a final ack that cannot be sent, is returned
+/// instead: the exit must not look clean when the next start replays.
+pub async fn supervise<F>(
+    name: &str,
+    mut stop: watch::Receiver<bool>,
+    mut start: impl FnMut() -> F,
+) -> anyhow::Result<()>
 where
     F: Future<Output = anyhow::Result<()>>,
 {
     let mut attempt = 0;
     loop {
+        if *stop.borrow() {
+            return Ok(()); // stopped before this attempt began: nothing to run or drain
+        }
         let began = Instant::now();
         let error = match start()
             .instrument(tracing::info_span!("pipeline", source = name))
             .await
         {
-            Ok(()) => return,
+            Ok(()) => return Ok(()),
             Err(error) => error,
         };
+        if *stop.borrow() {
+            // It failed while stopping, e.g. its final ack. Nothing to restart, and the exit must
+            // not look clean: the next start replays what this source had not acknowledged.
+            return Err(error.context(format!("source {name} failed while stopping")));
+        }
         if began.elapsed() >= RESTART_MAX {
             attempt = 0; // it ran long enough to count as healthy
         }
@@ -135,7 +149,7 @@ where
         );
         tokio::select! {
             () = sleep(delay) => {}
-            () = stopped(&mut stop) => return,
+            () = stopped(&mut stop) => return Ok(()),
         }
         attempt = attempt.saturating_add(1);
     }

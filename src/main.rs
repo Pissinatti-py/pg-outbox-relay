@@ -124,13 +124,22 @@ async fn relay_all<K: EventSink + Clone>(
                     relay::run(&name, source, sink, dead_letters?, batching, retry, health).await
                 }
             })
-            .await;
+            .await
         });
     }
-    // Pipelines end only when the relay stops. A panic is a bug: crash, and let the orchestrator restart.
+    // Pipelines end only when the relay stops, each finishing its drain even if another one's
+    // failed. A panic is a bug: crash, and let the orchestrator restart.
+    let mut failed = 0;
     while let Some(ended) = pipelines.join_next().await {
-        ended?;
+        if let Err(error) = ended? {
+            tracing::error!(error = format!("{error:#}"), "drain failed");
+            failed += 1;
+        }
     }
+    anyhow::ensure!(
+        failed == 0,
+        "{failed} of the sources could not finish draining; the next start replays what they had not acknowledged"
+    );
     Ok(())
 }
 

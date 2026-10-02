@@ -524,7 +524,8 @@ async fn a_failed_source_restarts_and_catches_up() {
             relay(source, sink).await
         }
     })
-    .await;
+    .await
+    .unwrap();
 
     assert_eq!(attempts.load(Ordering::SeqCst), 2);
     assert_eq!(ids(&sink.published()), ids(&events));
@@ -539,7 +540,7 @@ async fn stopping_during_a_restart_backoff_returns_at_once() {
     tokio::time::sleep(Duration::from_secs(90)).await; // several failures: now in a long backoff
     let stopped_at = tokio::time::Instant::now();
     stop.send_replace(true);
-    supervised.await.unwrap();
+    supervised.await.unwrap().unwrap();
     assert_eq!(
         stopped_at.elapsed(),
         Duration::ZERO,
@@ -559,10 +560,45 @@ async fn one_failing_source_does_not_hold_back_another() {
     relay::supervise("acme", stopped, move || {
         relay(FakeSource::new(&wal, Lsn(0)), healthy.clone())
     })
-    .await;
+    .await
+    .unwrap();
 
     assert_eq!(ids(&sink.published()), ids(&events));
     assert!(!broken.is_finished(), "the broken source keeps retrying");
     stop.send_replace(true);
-    broken.await.unwrap();
+    broken.await.unwrap().unwrap();
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_failure_while_stopping_is_returned_not_restarted() {
+    let (stop, stopped) = watch::channel(false);
+    let attempts = AtomicUsize::new(0);
+    let result = relay::supervise("acme", stopped, || {
+        attempts.fetch_add(1, Ordering::SeqCst);
+        // A deploy stops the relay, then the source's final ack cannot reach Postgres.
+        stop.send_replace(true);
+        async { anyhow::bail!("the final ack did not reach Postgres") }
+    })
+    .await;
+
+    assert_eq!(
+        attempts.load(Ordering::SeqCst),
+        1,
+        "restarted while stopping"
+    );
+    let error = result.expect_err("a failed drain looked clean");
+    assert!(format!("{error:#}").contains("final ack"), "{error:#}");
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_source_stopped_before_it_starts_runs_nothing() {
+    let (_stop, stopped) = watch::channel(true);
+    let attempts = AtomicUsize::new(0);
+    relay::supervise("acme", stopped, || {
+        attempts.fetch_add(1, Ordering::SeqCst);
+        async { anyhow::bail!("replication slot outbox_acme does not exist") }
+    })
+    .await
+    .unwrap();
+    assert_eq!(attempts.load(Ordering::SeqCst), 0);
 }
