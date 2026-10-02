@@ -1,5 +1,5 @@
 //! Ops endpoints: `/metrics` (Prometheus), `/healthz` (process alive),
-//! `/readyz` (at least one source streaming from its slot and able to publish).
+//! `/readyz` (a source streaming from its slot, and every pipeline able to publish).
 
 use std::net::SocketAddr;
 use std::sync::Arc;
@@ -10,7 +10,7 @@ use axum::http::StatusCode;
 use axum::routing::get;
 use metrics_exporter_prometheus::{Matcher, PrometheusBuilder, PrometheusHandle};
 
-use crate::app::Health;
+use crate::app::{self, Health};
 
 /// Installs the process-wide metrics recorder. Call once, before anything records.
 pub fn install_metrics() -> anyhow::Result<PrometheusHandle> {
@@ -39,8 +39,7 @@ pub async fn serve(
         .route(
             "/readyz",
             get(move || {
-                // Any source, not all: with two replicas sharing the slots, neither holds them all.
-                let ready = health.iter().any(|source| source.is_ready());
+                let ready = app::ready(&health);
                 async move {
                     if ready {
                         (StatusCode::OK, "ready")

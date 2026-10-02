@@ -471,7 +471,7 @@ The relay reads a TOML file (first argument, default `./relay.toml`), then envir
 | Endpoint | Meaning |
 |---|---|
 | `GET /healthz` | 200 when the process is alive |
-| `GET /readyz` | 200 when at least one of its sources streams from its slot **and** its last publish succeeded; 503 otherwise |
+| `GET /readyz` | 200 when at least one of its sources streams from its slot **and** no source's last publish failed; 503 otherwise |
 | `GET /metrics` | Prometheus metrics |
 
 **Metrics:**

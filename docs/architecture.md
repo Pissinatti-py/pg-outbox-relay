@@ -52,7 +52,7 @@ The core may use two facades, much like `log`: `tracing` for logs and `metrics` 
 | `src/domain/backoff.rs` | Exponential backoff with full jitter (pure: jitter is an argument) | — |
 | `src/ports.rs` | `EventSource`, `EventSink`, `DeadLetterStore`, `PublishError` | domain, tokio channels |
 | `src/app/relay.rs` | `relay::run`: channel → buffer → batch → publish/retry/dead-letter → checkpoint → ack; `relay::supervise`: restarts a failed source's pipeline | domain, ports |
-| `src/app/mod.rs` | `Health`: readiness flags behind `/readyz`; `stopped`: resolves when the relay is asked to stop | — |
+| `src/app/mod.rs` | `Health` and `ready`: what `/readyz` reports; `stopped`: resolves when the relay is asked to stop | — |
 | `src/adapters/postgres/mod.rs` | `PgSource`: connect/retry, the replication stream, acks, the slot-lag poller, DSN parsing, SQL connections over the same TLS | pgwire-replication, tokio-postgres |
 | `src/adapters/postgres/pgoutput.rs` | Decodes pgoutput `Relation` and `Insert`; maps a row to an `OutboxEvent` | domain |
 | `src/adapters/postgres/dead_letter.rs` | `PgDeadLetters`: stores rejected events in `outbox_dead_letter`; the startup check | tokio-postgres |
@@ -99,7 +99,7 @@ The core may use two facades, much like `log`: `tracing` for logs and `metrics` 
   - the slot is held by another relay (`55006`): this instance is the HA standby;
   - the database is starting (`57P03`) or unreachable.
 
-  Meanwhile `/readyz` returns 503.
+  Meanwhile that source is not ready: `/readyz` returns 503 unless another source streams.
 - **A missing slot fails that source**, with a hint to run `sql/slot.sql`, and it is retried with the backoff. The relay never creates slots: a recreated slot silently skips everything committed before it existed.
 - **A missing dead-letter table or grant fails that source** as it starts, once the database is reachable, instead of stalling at the first rejected event, and it is retried with the backoff.
 - **Broker errors never crash.** They are retried forever with backoff (100 ms up to 30 s), during which `sink_ready` is false.
