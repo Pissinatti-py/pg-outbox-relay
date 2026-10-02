@@ -28,6 +28,11 @@ pub struct Pg {
 }
 
 pub async fn postgres() -> anyhow::Result<Pg> {
+    postgres_with_fsync(false).await
+}
+
+/// [`postgres`], flushing every commit to disk as production does (`fsync=on`), or not, which is faster.
+pub async fn postgres_with_fsync(fsync: bool) -> anyhow::Result<Pg> {
     let container = Postgres::default()
         .with_init_sql(include_bytes!("../../sql/outbox.sql").to_vec())
         .with_init_sql(
@@ -41,7 +46,7 @@ pub async fn postgres() -> anyhow::Result<Pg> {
             "-c",
             "wal_level=logical",
             "-c",
-            "fsync=off",
+            if fsync { "fsync=on" } else { "fsync=off" },
             // The image's snakeoil certificate is enough for sslmode=require.
             "-c",
             "ssl=on",
@@ -235,6 +240,8 @@ pub async fn create_queue(sqs: &aws_sdk_sqs::Client, name: &str) -> anyhow::Resu
 /// One consumed message: its FIFO group, if any, and its body.
 pub struct Received {
     pub group: Option<String>,
+    /// When the broker accepted the message, in milliseconds since the epoch.
+    pub sent_ms: Option<u64>,
     pub envelope: Value,
 }
 
@@ -254,6 +261,7 @@ pub async fn receive(
             .max_number_of_messages(10)
             .wait_time_seconds(1)
             .message_system_attribute_names(MessageSystemAttributeName::MessageGroupId)
+            .message_system_attribute_names(MessageSystemAttributeName::SentTimestamp)
             .send()
             .await?;
         for message in batch.messages() {
@@ -262,6 +270,10 @@ pub async fn receive(
                     .attributes()
                     .and_then(|a| a.get(&MessageSystemAttributeName::MessageGroupId))
                     .cloned(),
+                sent_ms: message
+                    .attributes()
+                    .and_then(|a| a.get(&MessageSystemAttributeName::SentTimestamp))
+                    .and_then(|sent| sent.parse().ok()),
                 envelope: serde_json::from_str(message.body().expect("has a body"))?,
             });
             sqs.delete_message()
@@ -297,7 +309,7 @@ pub fn assert_ordered_per_aggregate(received: &[Received]) {
 }
 
 /// A relay process configured through the environment alone, like in a container.
-pub struct RelayProcess(Child);
+pub struct RelayProcess(pub Child);
 
 impl RelayProcess {
     pub fn start(source: &PgConfig, queue_url: &str, sqs_endpoint: &str) -> anyhow::Result<Self> {

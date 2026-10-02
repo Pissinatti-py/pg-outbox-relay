@@ -75,6 +75,7 @@ async fn relays_outbox_inserts_to_one_stream_per_aggregate_type() -> anyhow::Res
             assert_eq!(envelope["id"], id);
             common::Received {
                 group: None,
+                sent_ms: None,
                 envelope,
             }
         })

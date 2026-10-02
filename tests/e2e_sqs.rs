@@ -4,7 +4,7 @@
 mod common;
 
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use pg_outbox_relay::adapters::http;
 use pg_outbox_relay::adapters::postgres::{PgDeadLetters, PgSource};
@@ -68,6 +68,14 @@ async fn relays_outbox_inserts_to_a_fifo_queue_in_per_aggregate_order() -> anyho
         first.envelope["aggregate_id"].as_str().unwrap()
     );
     assert_eq!(first.group.as_deref(), Some(group.as_str()));
+    // The broker's send time: what the benchmark measures latency against.
+    let now_ms = SystemTime::now().duration_since(UNIX_EPOCH)?.as_millis() as u64;
+    assert!(
+        received
+            .iter()
+            .all(|r| r.sent_ms.is_some_and(|sent| now_ms.abs_diff(sent) < 60_000)),
+        "a message without a recent SentTimestamp"
+    );
     assert_eq!(first.envelope["headers"]["tenant"], "acme");
     assert!(
         first.envelope["occurred_at"]
